@@ -1,86 +1,98 @@
 """
 Polymarket CLOB v2 client for BTC Up/Down market.
-Handles authentication, market discovery, and order placement.
+Uses py_clob_client with pre-generated API credentials.
 """
 
 import os
 import json
 import time
 import requests
-from eth_account import Account
 from datetime import datetime
+
+try:
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+    from py_clob_client.constants import POLYGON
+    HAS_CLOB_CLIENT = True
+except ImportError:
+    HAS_CLOB_CLIENT = False
 
 
 class PolymarketClient:
     """
     Client for Polymarket CLOB v2 API.
-    Handles:
-    - API authentication (L1 + L2 auth)
-    - Market discovery (BTC Up/Down)
-    - Order placement (market buy YES/NO)
-    - Balance checking
+    Uses py_clob_client with pre-generated API credentials.
     """
 
     CLOB_HOST = "https://clob.polymarket.com"
     GAMMA_HOST = "https://gamma-api.polymarket.com"
 
-    def __init__(self, private_key: str, safe_address: str = None):
+    def __init__(self, private_key: str, safe_address: str = None,
+                 api_key: str = "", api_secret: str = "", api_passphrase: str = ""):
         """
         Args:
             private_key: Ethereum private key (0x prefixed)
-            safe_address: Polymarket Safe/proxy wallet address (optional)
+            safe_address: Polymarket Safe/proxy wallet address
+            api_key: Pre-generated CLOB API key
+            api_secret: Pre-generated CLOB API secret
+            api_passphrase: Pre-generated CLOB API passphrase
         """
         self.private_key = private_key
-        self.account = Account.from_key(private_key)
-        self.address = self.account.address
-        self.safe_address = safe_address or self.address
-        self.api_key = None
-        self.api_secret = None
-        self.api_passphrase = None
+        self.safe_address = safe_address
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.api_passphrase = api_passphrase
+        self.client = None
         self.session = requests.Session()
 
     def authenticate(self) -> bool:
         """
-        Authenticate with Polymarket CLOB v2.
-        Gets API credentials for trading.
+        Authenticate with Polymarket CLOB v2 using pre-generated API creds.
 
         Returns:
             True if authenticated successfully
         """
+        if not HAS_CLOB_CLIENT:
+            print("[AUTH] py_clob_client not installed!")
+            return False
+
         try:
-            # Step 1: Derive API credentials
-            # The CLOB v2 uses a signature-based auth
-            timestamp = int(time.time())
-            message = f"Polymarket CLOB API\nTimestamp: {timestamp}"
+            # Use pre-generated API credentials
+            if self.api_key and self.api_secret and self.api_passphrase:
+                creds = ApiCreds(
+                    api_key=self.api_key,
+                    api_secret=self.api_secret,
+                    api_passphrase=self.api_passphrase,
+                )
 
-            # Sign the message
-            from eth_account.messages import encode_defunct
-            msg = encode_defunct(text=message)
-            signed = self.account.sign_message(msg)
-
-            # Step 2: Register/login to get API keys
-            url = f"{self.CLOB_HOST}/auth/api-key"
-            payload = {
-                "address": self.address,
-                "timestamp": timestamp,
-                "signature": signed.signature.hex(),
-            }
-
-            response = self.session.post(url, json=payload, timeout=15)
-
-            if response.status_code == 200:
-                data = response.json()
-                self.api_key = data.get("apiKey")
-                self.api_secret = data.get("secret")
-                self.api_passphrase = data.get("passphrase")
-                print(f"[AUTH] Authenticated as {self.address[:10]}...")
-                return True
+                self.client = ClobClient(
+                    host=self.CLOB_HOST,
+                    chain_id=POLYGON,
+                    key=self.private_key,
+                    creds=creds,
+                )
             else:
-                print(f"[AUTH] Failed: {response.status_code} - {response.text}")
-                return False
+                # Try without creds (will derive)
+                self.client = ClobClient(
+                    host=self.CLOB_HOST,
+                    chain_id=POLYGON,
+                    key=self.private_key,
+                )
+                # Derive API key
+                creds = self.client.derive_api_key()
+                self.client = ClobClient(
+                    host=self.CLOB_HOST,
+                    chain_id=POLYGON,
+                    key=self.private_key,
+                    creds=creds,
+                )
+
+            # Test connection
+            print(f"[AUTH] Authenticated successfully!")
+            return True
 
         except Exception as e:
-            print(f"[AUTH] Error: {e}")
+            print(f"[AUTH] Failed: {e}")
             return False
 
     def find_btc_market(self) -> dict | None:
@@ -149,23 +161,17 @@ class PolymarketClient:
     def get_market_price(self, market: dict, side: str = "YES") -> float:
         """
         Get current market price for YES or NO.
-
-        Args:
-            market: Market dict from find_btc_market()
-            side: 'YES' or 'NO'
-
-        Returns:
-            Current price (0.0 to 1.0)
         """
         try:
             token_id = market["yes_token_id"] if side == "YES" else market["no_token_id"]
-            url = f"{self.CLOB_HOST}/price"
-            params = {"token_id": token_id, "side": "buy"}
 
-            response = self.session.get(url, params=params, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                return float(data.get("price", 0.5))
+            if self.client:
+                # Use py_clob_client
+                book = self.client.get_order_book(token_id)
+                if book and book.asks:
+                    return float(book.asks[0].price)
+                if book and book.bids:
+                    return float(book.bids[0].price)
         except Exception as e:
             print(f"[PRICE] Error: {e}")
 
@@ -175,13 +181,10 @@ class PolymarketClient:
     def get_balance(self) -> float:
         """Get collateral balance (USDC) on Polymarket."""
         try:
-            url = f"{self.CLOB_HOST}/balance"
-            headers = self._get_auth_headers()
-            response = self.session.get(url, headers=headers, timeout=10)
-
-            if response.status_code == 200:
-                data = response.json()
-                return float(data.get("balance", 0))
+            if self.client:
+                balance = self.client.get_balance_allowance()
+                if balance:
+                    return float(balance.get("balance", 0)) / 1e6  # USDC has 6 decimals
         except Exception as e:
             print(f"[BALANCE] Error: {e}")
         return 0.0
@@ -198,42 +201,28 @@ class PolymarketClient:
         Returns:
             Order result dict or None if failed
         """
+        if not self.client:
+            print("[ORDER] Client not authenticated")
+            return None
+
         try:
-            url = f"{self.CLOB_HOST}/order"
-            headers = self._get_auth_headers()
+            # Create market buy order using py_clob_client
+            order_args = OrderArgs(
+                token_id=token_id,
+                amount=amount,
+                side=side,
+            )
 
-            payload = {
-                "tokenID": token_id,
-                "amount": str(amount),
-                "side": side,
-                "type": "market",
-                "feeRateBps": "0",  # Taker fee handled by protocol
-            }
+            # Place as market order (FOK - Fill or Kill)
+            result = self.client.create_and_post_order(order_args)
 
-            response = self.session.post(url, json=payload, headers=headers, timeout=15)
-
-            if response.status_code == 200:
-                data = response.json()
-                print(f"[ORDER] Placed {side} ${amount} - ID: {data.get('orderID', 'unknown')}")
-                return data
+            if result:
+                print(f"[ORDER] Placed {side} ${amount} - Result: {result}")
+                return result
             else:
-                print(f"[ORDER] Failed: {response.status_code} - {response.text}")
+                print(f"[ORDER] No result returned")
                 return None
 
         except Exception as e:
             print(f"[ORDER] Error: {e}")
             return None
-
-    def _get_auth_headers(self) -> dict:
-        """Generate authenticated headers for CLOB v2."""
-        if not self.api_key:
-            return {}
-
-        timestamp = str(int(time.time()))
-        return {
-            "POLY-ADDRESS": self.address,
-            "POLY-API-KEY": self.api_key,
-            "POLY-SECRET": self.api_secret or "",
-            "POLY-PASSPHRASE": self.api_passphrase or "",
-            "POLY-TIMESTAMP": timestamp,
-        }

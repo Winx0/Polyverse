@@ -52,6 +52,9 @@ class TradingEngine:
                 self.client = PolymarketClient(
                     private_key=pk,
                     safe_address=config.get("SAFE_ADDRESS"),
+                    api_key=config.get("CLOB_API_KEY", ""),
+                    api_secret=config.get("CLOB_API_SECRET", ""),
+                    api_passphrase=config.get("CLOB_API_PASSPHRASE", ""),
                 )
 
         self.running = False
