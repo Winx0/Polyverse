@@ -1,0 +1,8 @@
+# Polymarket BTC Up/Down Trading Bot - Dependencies
+# Install: pip install -r requirements.txt
+
+requests>=2.31.0
+numpy>=1.24.0
+python-dotenv>=1.0.0
+eth-account>=0.10.0
+web3>=6.0.0
