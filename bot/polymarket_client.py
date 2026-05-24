@@ -98,9 +98,10 @@ class PolymarketClient:
     def find_btc_market(self) -> dict | None:
         """
         Find the active BTC 5-minute Up/Down market.
-        Uses dynamic slug based on current timestamp (rolling 5-min windows).
+        Uses dynamic slug based on current UTC timestamp (rolling 5-min windows).
+        Polymarket uses UTC timestamps in slugs directly.
         """
-        # Use cache if fresh (< 30 seconds)
+        # Use cache if fresh (< 30 seconds) AND not expired
         if hasattr(self, '_cached_market') and self._cached_market and \
            (time.time() - self._cache_time < 30):
             return self._cached_market
@@ -108,16 +109,15 @@ class PolymarketClient:
         market = None
 
         # BTC 5m markets use slug: btc-updown-5m-{unix_timestamp}
-        # Timestamp is rounded to nearest 300 seconds (5 minutes)
+        # The timestamp in the slug is the START time of the 5-min window in UTC
         current_ts = int(time.time())
         current_window = (current_ts // 300) * 300
-        next_window = current_window + 300
 
-        # Try current and next window slugs
+        # Try: next window (upcoming, accepting orders), current, and one after
         slugs_to_try = [
-            f"btc-updown-5m-{current_window}",
-            f"btc-updown-5m-{next_window}",
-            f"btc-updown-5m-{current_window - 300}",
+            f"btc-updown-5m-{current_window + 300}",   # next window (most likely accepting orders)
+            f"btc-updown-5m-{current_window}",          # current window
+            f"btc-updown-5m-{current_window + 600}",    # window after next
         ]
 
         for slug in slugs_to_try:
@@ -132,35 +132,34 @@ class PolymarketClient:
                         markets = event.get("markets", [])
                         if markets:
                             m = markets[0]
+                            # Check if market is still active (not closed)
+                            if m.get("closed", False):
+                                continue
+                            # Check end_date if available
+                            end_date = m.get("endDate") or m.get("end_date_iso", "")
+                            if end_date:
+                                try:
+                                    from datetime import datetime, timezone
+                                    # Parse ISO date
+                                    end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                                    now_dt = datetime.now(timezone.utc)
+                                    if end_dt < now_dt:
+                                        continue  # Market already expired
+                                except Exception:
+                                    pass
+
                             print(f"[MARKET] Found: {m.get('question', '')[:60]} (slug={slug})")
                             market = self._parse_market(m)
                             break
             except Exception as e:
                 continue
 
-        # Fallback: try fetching event directly by slug
-        if not market:
-            for slug in slugs_to_try:
-                try:
-                    url = f"{self.GAMMA_HOST}/events/{slug}"
-                    response = self.session.get(url, timeout=10)
-                    if response.status_code == 200:
-                        event = response.json()
-                        markets = event.get("markets", [])
-                        if markets:
-                            m = markets[0]
-                            print(f"[MARKET] Found: {m.get('question', '')[:60]}")
-                            market = self._parse_market(m)
-                            break
-                except Exception:
-                    continue
-
         if market:
             self._cached_market = market
             self._cache_time = time.time()
             return market
 
-        print(f"[MARKET] No BTC Up/Down market found (tried slugs: {slugs_to_try[0]})")
+        print(f"[MARKET] No active BTC Up/Down market found (ts={current_window})")
         return None
 
     def _parse_market(self, market: dict) -> dict:
@@ -186,12 +185,21 @@ class PolymarketClient:
                 yes_token = tokens[0]
                 no_token = tokens[1]
 
+        # ALWAYS prefer clobTokenIds if available (correct for CLOB orderbook)
+        clob_ids = market.get("clobTokenIds", [])
+        if clob_ids and len(clob_ids) >= 2:
+            yes_token_id = clob_ids[0]
+            no_token_id = clob_ids[1]
+        else:
+            yes_token_id = yes_token.get("token_id") if yes_token else None
+            no_token_id = no_token.get("token_id") if no_token else None
+
         return {
             "id": market.get("id") or market.get("condition_id") or market.get("conditionId"),
             "condition_id": market.get("conditionId") or market.get("condition_id"),
             "question": market.get("question"),
-            "yes_token_id": yes_token.get("token_id") if yes_token else None,
-            "no_token_id": no_token.get("token_id") if no_token else None,
+            "yes_token_id": yes_token_id,
+            "no_token_id": no_token_id,
             "yes_price": float(yes_token.get("price", 0.5)) if yes_token else 0.5,
             "no_price": float(no_token.get("price", 0.5)) if no_token else 0.5,
             "volume": market.get("volume", 0),
