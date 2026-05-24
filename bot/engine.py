@@ -1,6 +1,7 @@
 """
 Main trading engine - orchestrates all components.
 Runs the trading loop: fetch data -> analyze -> decide -> execute.
+Includes Flask mini server for live dashboard at http://localhost:5000/state
 """
 
 import os
@@ -8,6 +9,9 @@ import time
 import json
 from datetime import datetime
 from pathlib import Path
+from threading import Thread
+
+from flask import Flask, jsonify
 
 from bot.markov import MarkovModel
 from bot.kelly import KellySizer
@@ -15,6 +19,24 @@ from bot.price_feed import BTCPriceFeed
 from bot.polymarket_client import PolymarketClient
 from bot.journal import TradeJournal
 from bot.telegram_notifier import TelegramNotifier
+
+# --- Flask Dashboard Server ---
+flask_app = Flask(__name__)
+bot_state = {}
+
+@flask_app.route('/state')
+def get_state():
+    return jsonify(bot_state)
+
+@flask_app.route('/')
+def index():
+    return '<meta http-equiv="refresh" content="0;url=/state">'
+
+def _run_flask():
+    flask_app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+
+# Start Flask in background thread
+Thread(target=_run_flask, daemon=True).start()
 
 
 class TradingEngine:
@@ -61,6 +83,10 @@ class TradingEngine:
         self.running = False
         self.trades_today = 0
         self.signals_today = 0
+        self.wins = 0
+        self.losses = 0
+        self.skips = 0
+        self.resolved_list = []
         # Track 5-minute windows for proper Markov updates
         self.last_window_ts = 0
         self.window_start_price = None
@@ -156,6 +182,13 @@ class TradingEngine:
 
                 # Update Markov model with resolved window
                 self.markov.add_observation(resolved_state)
+                self.resolved_list.append({
+                    "state": resolved_state,
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                })
+                # Keep last 20 resolved
+                if len(self.resolved_list) > 20:
+                    self.resolved_list = self.resolved_list[-20:]
                 matrix = self.markov.get_transition_matrix()
                 print(f"    [WINDOW] Resolved: {resolved_state} | "
                       f"P(UP|UP)={matrix['P(UP|UP)']:.3f} "
@@ -180,22 +213,27 @@ class TradingEngine:
 
         if signal["action"] == "ENTER":
             self._execute_trade(signal)
+        else:
+            self.skips += 1
 
     def _evaluate_signal(self, state: str, persistence: float) -> dict:
         """Evaluate whether to enter a trade."""
         # Simulate market price (in dry run) or fetch real
         market_price = 0.50  # Default
+        market_name = ""
 
         if self.client and not self.dry_run:
             market = self.client.find_btc_market()
             if market:
                 side = "YES" if state == "UP" else "NO"
                 market_price = self.client.get_market_price(market, side)
+                market_name = market.get("question", "")
         else:
             # In dry run, simulate market price based on persistence
             # Market usually prices between 0.45-0.65
             import random
             market_price = 0.45 + random.random() * 0.20
+            market_name = "DRY RUN (simulated)"
 
         # Calculate edge
         edge = persistence - market_price
@@ -208,6 +246,7 @@ class TradingEngine:
             "edge": edge,
             "action": "SKIP",
             "reason": "",
+            "market_name": market_name,
         }
 
         # Entry conditions
@@ -223,6 +262,9 @@ class TradingEngine:
 
         # Log signal
         self.journal.log_signal(signal)
+
+        # Update dashboard state
+        self._update_bot_state(signal)
 
         status = ">>>" if signal["action"] == "ENTER" else "   "
         print(
@@ -303,6 +345,10 @@ class TradingEngine:
 
         emoji = "WIN" if won else "LOSS"
         print(f"    <<< {emoji}: P/L ${pnl:+.4f} | Bankroll: ${self.bankroll:.2f}")
+        if won:
+            self.wins += 1
+        else:
+            self.losses += 1
 
     def _live_execute(self, signal: dict, bet_size: float):
         """Execute real trade on Polymarket."""
@@ -324,6 +370,39 @@ class TradingEngine:
             print(f"    [LIVE] Order placed: {result}")
         else:
             print(f"    [LIVE] Order failed")
+
+    def _update_bot_state(self, signal: dict):
+        """Update global bot_state for Flask dashboard and write to file."""
+        global bot_state
+        matrix = self.markov.get_transition_matrix()
+        bot_state = {
+            "bankroll": round(self.bankroll, 4),
+            "state": signal["state"],
+            "p": round(signal["persistence_prob"], 4),
+            "q": round(signal["market_price"], 4),
+            "edge": round(signal["edge"], 4),
+            "action": signal["action"],
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "wins": self.wins,
+            "losses": self.losses,
+            "skips": self.skips,
+            "p_up_up": round(float(matrix["P(UP|UP)"]), 4),
+            "p_dn_dn": round(float(matrix["P(DOWN|DOWN)"]), 4),
+            "hist_size": len(self.markov.history),
+            "market": signal.get("market_name", ""),
+            "resolved": self.resolved_list,
+            "mode": "DRY RUN" if self.dry_run else "LIVE",
+            "min_prob": self.min_prob,
+            "min_edge": self.min_edge,
+        }
+        # Write to file as backup
+        try:
+            state_path = Path("data/bot_state.json")
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(state_path, "w") as f:
+                json.dump(bot_state, f, indent=2)
+        except Exception:
+            pass
 
     def _print_summary(self):
         """Print session summary."""
