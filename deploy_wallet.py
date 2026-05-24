@@ -47,11 +47,20 @@ ERC20_ABI = json.loads('[{"constant":false,"inputs":[{"name":"spender","type":"a
 # Max uint256 for unlimited approval
 MAX_UINT256 = 2**256 - 1
 
-# Polygon RPC endpoints
+# Polygon RPC endpoints (many fallbacks)
 RPC_URLS = [
+    "https://polygon.drpc.org",
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://polygon.meowrpc.com",
+    "https://1rpc.io/matic",
     "https://polygon-rpc.com",
     "https://rpc.ankr.com/polygon",
     "https://polygon.llamarpc.com",
+    "https://rpc-mainnet.matic.quiknode.pro",
+    "https://polygon.blockpi.network/v1/rpc/public",
+    "https://polygon-mainnet.public.blastapi.io",
+    "https://api.zan.top/node/v1/polygon/mainnet/public",
+    "https://polygon.gateway.tenderly.co",
 ]
 
 
@@ -59,13 +68,19 @@ def get_web3():
     """Connect to Polygon network."""
     for rpc in RPC_URLS:
         try:
-            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
+            print(f"       Trying {rpc}...", end=" ")
+            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 8}))
             if w3.is_connected():
-                print(f"[OK] Connected to Polygon via {rpc}")
+                print("OK!")
                 return w3
+            else:
+                print("failed")
         except Exception:
+            print("timeout")
             continue
-    print("[ERROR] Cannot connect to Polygon network!")
+    print("\n[ERROR] Cannot connect to Polygon network!")
+    print("[TIP]  Your network may be blocking crypto RPCs.")
+    print("       Try using a VPN, or mobile hotspot.")
     sys.exit(1)
 
 
