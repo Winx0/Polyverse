@@ -129,27 +129,61 @@ class PolymarketClient:
                     events = response.json()
                     if events and len(events) > 0:
                         event = events[0]
-                        markets = event.get("markets", [])
-                        if markets:
-                            m = markets[0]
-                            # Check if market is still active (not closed)
-                            if m.get("closed", False):
-                                continue
-                            # Check end_date if available
-                            end_date = m.get("endDate") or m.get("end_date_iso", "")
-                            if end_date:
-                                try:
-                                    from datetime import datetime, timezone
-                                    # Parse ISO date
-                                    end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-                                    now_dt = datetime.now(timezone.utc)
-                                    if end_dt < now_dt:
-                                        continue  # Market already expired
-                                except Exception:
-                                    pass
+                        event_markets = event.get("markets", [])
+                        if not event_markets:
+                            continue
 
-                            print(f"[MARKET] Found: {m.get('question', '')[:60]} (slug={slug})")
-                            market = self._parse_market(m)
+                        # BTC Up/Down has 2 sub-markets: "Up" and "Down"
+                        # Each has its own clobTokenIds
+                        up_token_id = None
+                        down_token_id = None
+                        up_price = 0.5
+                        down_price = 0.5
+                        question = event.get("title", "")
+                        end_date = None
+                        is_closed = False
+
+                        for m in event_markets:
+                            outcome = str(m.get("groupItemTitle", m.get("outcome", ""))).lower()
+                            clob_ids = m.get("clobTokenIds", [])
+
+                            if m.get("closed", False):
+                                is_closed = True
+                            end_date = m.get("endDate") or end_date
+
+                            if "up" in outcome and clob_ids:
+                                up_token_id = clob_ids[0]
+                                up_price = float(m.get("outcomePrices", "0.5,0.5").split(",")[0]) if m.get("outcomePrices") else 0.5
+                                question = m.get("question", question)
+                            elif "down" in outcome and clob_ids:
+                                down_token_id = clob_ids[0]
+                                down_price = float(m.get("outcomePrices", "0.5,0.5").split(",")[0]) if m.get("outcomePrices") else 0.5
+
+                        # Skip if closed or expired
+                        if is_closed:
+                            continue
+                        if end_date:
+                            try:
+                                from datetime import datetime, timezone
+                                end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                                if end_dt < datetime.now(timezone.utc):
+                                    continue
+                            except Exception:
+                                pass
+
+                        if up_token_id and down_token_id:
+                            print(f"[MARKET] Found: {question[:60]} (slug={slug})")
+                            market = {
+                                "id": event.get("id"),
+                                "condition_id": event.get("conditionId", ""),
+                                "question": question,
+                                "yes_token_id": up_token_id,
+                                "no_token_id": down_token_id,
+                                "yes_price": up_price,
+                                "no_price": down_price,
+                                "volume": event.get("volume", 0),
+                                "end_date": end_date,
+                            }
                             break
             except Exception as e:
                 continue
