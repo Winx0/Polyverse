@@ -103,29 +103,52 @@ class PolymarketClient:
             Market dict with token_ids, prices, etc.
         """
         try:
-            # Search for BTC markets on Gamma API
-            url = f"{self.GAMMA_HOST}/markets"
-            params = {
-                "closed": "false",
-                "tag": "crypto",
-                "limit": 50,
-            }
+            # Method 1: Search Gamma API with different params
+            urls_to_try = [
+                (f"{self.GAMMA_HOST}/markets", {"closed": "false", "tag": "crypto", "limit": 100}),
+                (f"{self.GAMMA_HOST}/markets", {"closed": "false", "limit": 200}),
+            ]
 
-            response = self.session.get(url, params=params, timeout=15)
-            response.raise_for_status()
-            markets = response.json()
+            for url, params in urls_to_try:
+                try:
+                    response = self.session.get(url, params=params, timeout=15)
+                    if response.status_code != 200:
+                        continue
+                    markets = response.json()
 
-            # Filter for BTC Up/Down 5-minute markets
-            for market in markets:
-                title = market.get("question", "").lower()
-                if "btc" in title and ("up" in title or "down" in title) and "5" in title:
-                    return self._parse_market(market)
+                    # Priority 1: BTC Up/Down 5-minute
+                    for market in markets:
+                        title = market.get("question", "").lower()
+                        if ("btc" in title or "bitcoin" in title) and \
+                           ("up" in title or "down" in title) and \
+                           ("5m" in title or "5 m" in title or "5min" in title):
+                            print(f"[MARKET] Found: {market.get('question', '')[:60]}")
+                            return self._parse_market(market)
 
-            # Broader search
-            for market in markets:
-                title = market.get("question", "").lower()
-                if "bitcoin" in title and ("up" in title or "down" in title):
-                    return self._parse_market(market)
+                    # Priority 2: BTC Up or Down (any timeframe)
+                    for market in markets:
+                        title = market.get("question", "").lower()
+                        if ("btc" in title or "bitcoin" in title) and \
+                           ("up" in title or "down" in title):
+                            print(f"[MARKET] Found: {market.get('question', '')[:60]}")
+                            return self._parse_market(market)
+
+                except Exception:
+                    continue
+
+            # Method 2: Try CLOB client directly
+            if self.client:
+                try:
+                    markets = self.client.get_markets()
+                    if markets:
+                        for market in markets:
+                            title = str(market.get("question", "")).lower()
+                            if ("btc" in title or "bitcoin" in title) and \
+                               ("up" in title or "down" in title):
+                                print(f"[MARKET] Found via CLOB: {market.get('question', '')[:60]}")
+                                return self._parse_market(market)
+                except Exception:
+                    pass
 
             print("[MARKET] No BTC Up/Down market found")
             return None
