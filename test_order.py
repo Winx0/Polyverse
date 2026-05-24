@@ -1,7 +1,7 @@
 """
 Test single order placement on Polymarket.
-Uses proxy from .env.bot (PROXY=socks5://...) to bypass geoblock.
-Run: python test_order.py
+Auto-tries free SOCKS5 proxies from EU to bypass geoblock.
+Run: pip install pysocks && python test_order.py
 """
 import os
 import time
@@ -12,11 +12,56 @@ load_dotenv('.env.bot')
 import requests
 
 # --- PROXY CONFIG ---
+# Try proxy from .env.bot first, then auto-try free EU proxies
 PROXY = os.getenv("PROXY", "")
-if PROXY:
-    os.environ['HTTP_PROXY'] = PROXY
-    os.environ['HTTPS_PROXY'] = PROXY
-    print(f"[PROXY] Using: {PROXY}")
+
+# Free SOCKS5 proxies from EU/allowed regions (updated from public lists)
+FREE_PROXIES = [
+    "socks5://5.75.211.227:1080",       # Germany (Hetzner)
+    "socks5://161.97.118.197:1080",      # Germany
+    "socks5://173.212.239.43:1080",      # Germany
+    "socks5://152.53.144.223:1080",      # Netherlands
+    "socks5://85.155.96.109:1080",       # Netherlands
+    "socks5://213.121.165.12:1080",      # UK
+    "socks5://89.124.79.162:1080",       # Bulgaria (EU)
+    "socks5://212.48.150.38:1080",       # Poland (EU)
+    "socks5://150.241.106.113:1080",     # Germany
+    "socks5://167.71.42.89:1080",        # Netherlands
+]
+
+def find_working_proxy():
+    """Try proxies until one works from an allowed country."""
+    if PROXY:
+        return PROXY
+
+    print("[PROXY] Testing free EU proxies...")
+    for proxy in FREE_PROXIES:
+        try:
+            r = requests.get("https://ipinfo.io/json",
+                           proxies={"http": proxy, "https": proxy},
+                           timeout=5)
+            if r.status_code == 200:
+                info = r.json()
+                country = info.get("country", "")
+                # Polymarket allowed: EU, UK, Canada, Singapore, etc.
+                # Blocked: US, Indonesia, China
+                blocked = ["US", "ID", "CN", "KP", "IR", "CU", "SY"]
+                if country not in blocked:
+                    print(f"[PROXY] Working! {proxy} -> {country} ({info.get('city','')})")
+                    return proxy
+                else:
+                    print(f"[PROXY] {proxy} -> {country} (BLOCKED)")
+        except Exception:
+            continue
+    return None
+
+working_proxy = find_working_proxy()
+if working_proxy:
+    os.environ['HTTP_PROXY'] = working_proxy
+    os.environ['HTTPS_PROXY'] = working_proxy
+    print(f"[PROXY] Set: {working_proxy}")
+else:
+    print("[PROXY] No working proxy found! Order will likely fail.")
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds
