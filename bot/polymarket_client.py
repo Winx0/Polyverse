@@ -98,82 +98,70 @@ class PolymarketClient:
     def find_btc_market(self) -> dict | None:
         """
         Find the active BTC 5-minute Up/Down market.
-        Uses multiple methods with caching.
+        Uses dynamic slug based on current timestamp (rolling 5-min windows).
         """
-        # Use cache if fresh (< 60 seconds)
+        # Use cache if fresh (< 30 seconds)
         if hasattr(self, '_cached_market') and self._cached_market and \
-           (time.time() - self._cache_time < 60):
+           (time.time() - self._cache_time < 30):
             return self._cached_market
 
         market = None
 
-        # Method 1: CLOB client get_markets (most reliable with auth)
-        if self.client:
-            try:
-                resp = self.client.get_markets()
-                markets = resp if isinstance(resp, list) else []
-                for m in markets:
-                    if self._is_btc_updown(m):
-                        print(f"[MARKET] Found via CLOB: {m.get('question', '')[:60]}")
-                        market = self._parse_market(m)
-                        break
-            except Exception as e:
-                print(f"[MARKET] CLOB search: {e}")
+        # BTC 5m markets use slug: btc-updown-5m-{unix_timestamp}
+        # Timestamp is rounded to nearest 300 seconds (5 minutes)
+        current_ts = int(time.time())
+        current_window = (current_ts // 300) * 300
+        next_window = current_window + 300
 
-        # Method 2: CLOB REST endpoint
-        if not market:
+        # Try current and next window slugs
+        slugs_to_try = [
+            f"btc-updown-5m-{current_window}",
+            f"btc-updown-5m-{next_window}",
+            f"btc-updown-5m-{current_window - 300}",
+        ]
+
+        for slug in slugs_to_try:
             try:
-                url = f"{self.CLOB_HOST}/simplified-markets"
-                params = {"next_cursor": "MA=="}
+                url = f"{self.GAMMA_HOST}/events"
+                params = {"slug": slug}
                 response = self.session.get(url, params=params, timeout=10)
                 if response.status_code == 200:
-                    data = response.json()
-                    markets = data.get("data", []) if isinstance(data, dict) else data
-                    for m in markets:
-                        if self._is_btc_updown(m):
-                            print(f"[MARKET] Found via REST: {m.get('question', '')[:60]}")
+                    events = response.json()
+                    if events and len(events) > 0:
+                        event = events[0]
+                        markets = event.get("markets", [])
+                        if markets:
+                            m = markets[0]
+                            print(f"[MARKET] Found: {m.get('question', '')[:60]} (slug={slug})")
                             market = self._parse_market(m)
                             break
             except Exception as e:
-                print(f"[MARKET] REST search: {e}")
+                continue
 
-        # Method 3: Gamma API
+        # Fallback: try fetching event directly by slug
         if not market:
-            try:
-                url = f"{self.GAMMA_HOST}/markets"
-                params = {"closed": "false", "limit": 200}
-                response = self.session.get(url, params=params, timeout=10)
-                if response.status_code == 200:
-                    markets = response.json()
-                    for m in markets:
-                        if self._is_btc_updown(m):
-                            print(f"[MARKET] Found via Gamma: {m.get('question', '')[:60]}")
+            for slug in slugs_to_try:
+                try:
+                    url = f"{self.GAMMA_HOST}/events/{slug}"
+                    response = self.session.get(url, timeout=10)
+                    if response.status_code == 200:
+                        event = response.json()
+                        markets = event.get("markets", [])
+                        if markets:
+                            m = markets[0]
+                            print(f"[MARKET] Found: {m.get('question', '')[:60]}")
                             market = self._parse_market(m)
                             break
-            except Exception as e:
-                print(f"[MARKET] Gamma search: {e}")
+                except Exception:
+                    continue
 
         if market:
             self._cached_market = market
             self._cache_time = time.time()
             return market
 
-        print("[MARKET] No BTC Up/Down market found")
+        print(f"[MARKET] No BTC Up/Down market found (tried slugs: {slugs_to_try[0]})")
         return None
-
-    def _is_btc_updown(self, market: dict) -> bool:
-        """Check if market is a BTC Up/Down market."""
-        title = str(market.get("question", "")).lower()
-        slug = str(market.get("slug", "")).lower()
-        desc = str(market.get("description", "")).lower()
-        all_text = f"{title} {slug} {desc}"
-
-        is_btc = "btc" in all_text or "bitcoin" in all_text
-        is_updown = "up" in title and "down" in title or \
-                    "up or down" in title or "updown" in slug
-        is_active = not market.get("closed", False)
-
-        return is_btc and is_updown and is_active
 
     def _parse_market(self, market: dict) -> dict:
         """Parse raw market data into usable format."""
@@ -188,13 +176,18 @@ class PolymarketClient:
             elif outcome in ("no", "down"):
                 no_token = token
 
-        # If tokens not found, try first two
-        if not yes_token and not no_token and len(tokens) >= 2:
-            yes_token = tokens[0]
-            no_token = tokens[1]
+        # If tokens not found by outcome, try clobTokenIds
+        if not yes_token and not no_token:
+            clob_ids = market.get("clobTokenIds", [])
+            if len(clob_ids) >= 2:
+                yes_token = {"token_id": clob_ids[0], "price": 0.5}
+                no_token = {"token_id": clob_ids[1], "price": 0.5}
+            elif len(tokens) >= 2:
+                yes_token = tokens[0]
+                no_token = tokens[1]
 
         return {
-            "id": market.get("id") or market.get("condition_id"),
+            "id": market.get("id") or market.get("condition_id") or market.get("conditionId"),
             "condition_id": market.get("conditionId") or market.get("condition_id"),
             "question": market.get("question"),
             "yes_token_id": yes_token.get("token_id") if yes_token else None,
