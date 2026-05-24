@@ -33,8 +33,8 @@ class TradingEngine:
         # Initialize components
         self.markov = MarkovModel(window_size=50)
         self.kelly = KellySizer(
-            max_fraction=0.25,
-            min_bet=config.get("MIN_BET", 0.50),
+            max_fraction=0.50,
+            min_bet=config.get("MIN_BET", 0.10),
             max_bet=config.get("MAX_BET", 2.00),
         )
         self.price_feed = BTCPriceFeed(interval="5m")
