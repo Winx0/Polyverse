@@ -98,64 +98,82 @@ class PolymarketClient:
     def find_btc_market(self) -> dict | None:
         """
         Find the active BTC 5-minute Up/Down market.
-
-        Returns:
-            Market dict with token_ids, prices, etc.
+        Uses multiple methods with caching.
         """
-        try:
-            # Method 1: Search Gamma API with different params
-            urls_to_try = [
-                (f"{self.GAMMA_HOST}/markets", {"closed": "false", "tag": "crypto", "limit": 100}),
-                (f"{self.GAMMA_HOST}/markets", {"closed": "false", "limit": 200}),
-            ]
+        # Use cache if fresh (< 60 seconds)
+        if hasattr(self, '_cached_market') and self._cached_market and \
+           (time.time() - self._cache_time < 60):
+            return self._cached_market
 
-            for url, params in urls_to_try:
-                try:
-                    response = self.session.get(url, params=params, timeout=15)
-                    if response.status_code != 200:
-                        continue
+        market = None
+
+        # Method 1: CLOB client get_markets (most reliable with auth)
+        if self.client:
+            try:
+                resp = self.client.get_markets()
+                markets = resp if isinstance(resp, list) else []
+                for m in markets:
+                    if self._is_btc_updown(m):
+                        print(f"[MARKET] Found via CLOB: {m.get('question', '')[:60]}")
+                        market = self._parse_market(m)
+                        break
+            except Exception as e:
+                print(f"[MARKET] CLOB search: {e}")
+
+        # Method 2: CLOB REST endpoint
+        if not market:
+            try:
+                url = f"{self.CLOB_HOST}/simplified-markets"
+                params = {"next_cursor": "MA=="}
+                response = self.session.get(url, params=params, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    markets = data.get("data", []) if isinstance(data, dict) else data
+                    for m in markets:
+                        if self._is_btc_updown(m):
+                            print(f"[MARKET] Found via REST: {m.get('question', '')[:60]}")
+                            market = self._parse_market(m)
+                            break
+            except Exception as e:
+                print(f"[MARKET] REST search: {e}")
+
+        # Method 3: Gamma API
+        if not market:
+            try:
+                url = f"{self.GAMMA_HOST}/markets"
+                params = {"closed": "false", "limit": 200}
+                response = self.session.get(url, params=params, timeout=10)
+                if response.status_code == 200:
                     markets = response.json()
+                    for m in markets:
+                        if self._is_btc_updown(m):
+                            print(f"[MARKET] Found via Gamma: {m.get('question', '')[:60]}")
+                            market = self._parse_market(m)
+                            break
+            except Exception as e:
+                print(f"[MARKET] Gamma search: {e}")
 
-                    # Priority 1: BTC Up/Down 5-minute
-                    for market in markets:
-                        title = market.get("question", "").lower()
-                        if ("btc" in title or "bitcoin" in title) and \
-                           ("up" in title or "down" in title) and \
-                           ("5m" in title or "5 m" in title or "5min" in title):
-                            print(f"[MARKET] Found: {market.get('question', '')[:60]}")
-                            return self._parse_market(market)
+        if market:
+            self._cached_market = market
+            self._cache_time = time.time()
+            return market
 
-                    # Priority 2: BTC Up or Down (any timeframe)
-                    for market in markets:
-                        title = market.get("question", "").lower()
-                        if ("btc" in title or "bitcoin" in title) and \
-                           ("up" in title or "down" in title):
-                            print(f"[MARKET] Found: {market.get('question', '')[:60]}")
-                            return self._parse_market(market)
+        print("[MARKET] No BTC Up/Down market found")
+        return None
 
-                except Exception:
-                    continue
+    def _is_btc_updown(self, market: dict) -> bool:
+        """Check if market is a BTC Up/Down market."""
+        title = str(market.get("question", "")).lower()
+        slug = str(market.get("slug", "")).lower()
+        desc = str(market.get("description", "")).lower()
+        all_text = f"{title} {slug} {desc}"
 
-            # Method 2: Try CLOB client directly
-            if self.client:
-                try:
-                    markets = self.client.get_markets()
-                    if markets:
-                        for market in markets:
-                            title = str(market.get("question", "")).lower()
-                            if ("btc" in title or "bitcoin" in title) and \
-                               ("up" in title or "down" in title):
-                                print(f"[MARKET] Found via CLOB: {market.get('question', '')[:60]}")
-                                return self._parse_market(market)
-                except Exception:
-                    pass
+        is_btc = "btc" in all_text or "bitcoin" in all_text
+        is_updown = "up" in title and "down" in title or \
+                    "up or down" in title or "updown" in slug
+        is_active = not market.get("closed", False)
 
-            print("[MARKET] No BTC Up/Down market found")
-            return None
-
-        except Exception as e:
-            print(f"[MARKET] Error finding market: {e}")
-            return None
+        return is_btc and is_updown and is_active
 
     def _parse_market(self, market: dict) -> dict:
         """Parse raw market data into usable format."""
@@ -164,21 +182,27 @@ class PolymarketClient:
         no_token = None
 
         for token in tokens:
-            if token.get("outcome", "").lower() == "yes":
+            outcome = str(token.get("outcome", "")).lower()
+            if outcome in ("yes", "up"):
                 yes_token = token
-            elif token.get("outcome", "").lower() == "no":
+            elif outcome in ("no", "down"):
                 no_token = token
 
+        # If tokens not found, try first two
+        if not yes_token and not no_token and len(tokens) >= 2:
+            yes_token = tokens[0]
+            no_token = tokens[1]
+
         return {
-            "id": market.get("id"),
-            "condition_id": market.get("conditionId"),
+            "id": market.get("id") or market.get("condition_id"),
+            "condition_id": market.get("conditionId") or market.get("condition_id"),
             "question": market.get("question"),
             "yes_token_id": yes_token.get("token_id") if yes_token else None,
             "no_token_id": no_token.get("token_id") if no_token else None,
             "yes_price": float(yes_token.get("price", 0.5)) if yes_token else 0.5,
             "no_price": float(no_token.get("price", 0.5)) if no_token else 0.5,
             "volume": market.get("volume", 0),
-            "end_date": market.get("endDate"),
+            "end_date": market.get("endDate") or market.get("end_date_iso"),
         }
 
     def get_market_price(self, market: dict, side: str = "YES") -> float:
