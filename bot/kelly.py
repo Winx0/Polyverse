@@ -25,11 +25,11 @@ class KellySizer:
             b = q / (1 - q)
     """
 
-    def __init__(self, max_fraction: float = 0.25, min_bet: float = 1.0, max_bet: float = 50.0):
+    def __init__(self, max_fraction: float = 0.50, min_bet: float = 0.10, max_bet: float = 50.0):
         """
         Args:
             max_fraction: Maximum Kelly fraction (cap to reduce variance).
-                          0.25 = quarter-Kelly, conservative.
+                          0.50 = half-Kelly, balanced risk/reward.
             min_bet: Minimum bet size in dollars.
             max_bet: Maximum bet size in dollars.
         """
@@ -85,10 +85,12 @@ class KellySizer:
 
         bet = bankroll * fraction
 
-        # Apply min/max constraints
+        # If bet is below min_bet but we have enough bankroll, use min_bet
         if bet < self.min_bet:
-            # If Kelly says bet less than minimum, skip trade
-            return 0.0
+            if bankroll >= self.min_bet:
+                bet = self.min_bet
+            else:
+                return 0.0  # Can't afford min bet
 
         bet = min(bet, self.max_bet)
         bet = min(bet, bankroll)  # Never bet more than you have
