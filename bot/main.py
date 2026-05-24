@@ -34,6 +34,9 @@ def load_config() -> dict:
         # Polymarket credentials
         "PRIVATE_KEY": os.getenv("PRIVATE_KEY", ""),
         "SAFE_ADDRESS": os.getenv("SAFE_ADDRESS", ""),
+        "CLOB_API_KEY": os.getenv("CLOB_API_KEY", ""),
+        "CLOB_API_SECRET": os.getenv("CLOB_API_SECRET", ""),
+        "CLOB_API_PASSPHRASE": os.getenv("CLOB_API_PASSPHRASE", ""),
 
         # Telegram notifications
         "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", ""),
