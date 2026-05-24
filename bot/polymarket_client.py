@@ -109,15 +109,19 @@ class PolymarketClient:
         market = None
 
         # BTC 5m markets use slug: btc-updown-5m-{unix_timestamp}
-        # The timestamp in the slug is the START time of the 5-min window in UTC
+        # The timestamp in slug is ET-based (UTC-4), rounded to 5 min
+        # We need to find a market that is CURRENTLY accepting orders
+        # (not yet resolved)
         current_ts = int(time.time())
         current_window = (current_ts // 300) * 300
 
-        # Try: next window (upcoming, accepting orders), current, and one after
+        # Try multiple windows: future windows first (accepting orders)
+        # then current (might still be open)
         slugs_to_try = [
-            f"btc-updown-5m-{current_window + 300}",   # next window (most likely accepting orders)
+            f"btc-updown-5m-{current_window + 600}",   # 2 windows ahead
+            f"btc-updown-5m-{current_window + 300}",   # next window
+            f"btc-updown-5m-{current_window + 900}",   # 3 windows ahead
             f"btc-updown-5m-{current_window}",          # current window
-            f"btc-updown-5m-{current_window + 600}",    # window after next
         ]
 
         for slug in slugs_to_try:
@@ -164,8 +168,6 @@ class PolymarketClient:
                             clob_ids = clob_ids_raw
 
                         if len(clob_ids) >= 2:
-                            print(f"[DEBUG] UP token: {clob_ids[0][:20]}...")
-                            print(f"[DEBUG] DOWN token: {clob_ids[1][:20]}...")
                             question = m.get("question", "")
                             # Parse prices from outcomePrices (can be string or list)
                             up_price = 0.5
@@ -187,7 +189,13 @@ class PolymarketClient:
                                 except Exception:
                                     pass
 
+                            # Skip if price is 0.99+ (market already resolved/no liquidity)
+                            if up_price >= 0.95 or down_price >= 0.95:
+                                print(f"[MARKET] Skipping {slug} - price {up_price}/{down_price} (resolved/no liquidity)")
+                                continue
+
                             print(f"[MARKET] Found: {question[:60]} (slug={slug})")
+                            print(f"[MARKET] UP price={up_price:.3f} | DOWN price={down_price:.3f}")
                             market = {
                                 "id": m.get("id"),
                                 "condition_id": m.get("conditionId", ""),
@@ -257,23 +265,36 @@ class PolymarketClient:
 
     def get_market_price(self, market: dict, side: str = "YES") -> float:
         """
-        Get current market price for YES or NO.
+        Get current market price for YES (UP) or NO (DOWN).
+        Tries orderbook first, falls back to cached outcomePrices.
         """
         try:
             token_id = market["yes_token_id"] if side == "YES" else market["no_token_id"]
 
-            if self.client:
-                # Use py_clob_client
+            if self.client and token_id:
+                # Use py_clob_client to get live orderbook
                 book = self.client.get_order_book(token_id)
-                if book and book.asks:
-                    return float(book.asks[0].price)
-                if book and book.bids:
-                    return float(book.bids[0].price)
+                if book:
+                    # Best ask = cheapest price to buy
+                    if book.asks and len(book.asks) > 0:
+                        price = float(book.asks[0].price)
+                        if 0.01 < price < 0.99:  # Valid price range
+                            return price
+                    # If no asks, try best bid
+                    if book.bids and len(book.bids) > 0:
+                        price = float(book.bids[0].price)
+                        if 0.01 < price < 0.99:
+                            return price
         except Exception as e:
-            print(f"[PRICE] Error: {e}")
+            # Don't print error every tick - only if not 404
+            if "404" not in str(e):
+                print(f"[PRICE] Error: {e}")
 
-        # Fallback to market data
-        return market.get(f"{side.lower()}_price", 0.5)
+        # Fallback to cached market data from Gamma API
+        fallback = market.get(f"{side.lower()}_price", 0.5)
+        if 0.01 < fallback < 0.99:
+            return fallback
+        return 0.5  # Safe default
 
     def get_balance(self) -> float:
         """Get collateral balance (USDC) on Polymarket."""
