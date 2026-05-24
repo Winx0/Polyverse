@@ -152,16 +152,36 @@ class PolymarketClient:
                             except Exception:
                                 pass
 
-                        clob_ids = m.get("clobTokenIds", [])
+                        clob_ids_raw = m.get("clobTokenIds", [])
+                        # Handle both list and JSON string format
+                        if isinstance(clob_ids_raw, str):
+                            import json as _json
+                            try:
+                                clob_ids = _json.loads(clob_ids_raw)
+                            except Exception:
+                                clob_ids = []
+                        else:
+                            clob_ids = clob_ids_raw
+
                         if len(clob_ids) >= 2:
+                            print(f"[DEBUG] UP token: {clob_ids[0][:20]}...")
+                            print(f"[DEBUG] DOWN token: {clob_ids[1][:20]}...")
                             question = m.get("question", "")
-                            # Parse prices from outcomePrices string "0.52,0.48"
+                            # Parse prices from outcomePrices (can be string or list)
                             up_price = 0.5
                             down_price = 0.5
-                            prices_str = m.get("outcomePrices", "")
-                            if prices_str:
+                            prices_raw = m.get("outcomePrices", "")
+                            if prices_raw:
                                 try:
-                                    prices = prices_str.split(",")
+                                    if isinstance(prices_raw, str):
+                                        # Could be JSON string '["0.52","0.48"]' or comma-separated "0.52,0.48"
+                                        if prices_raw.startswith("["):
+                                            import json as _json
+                                            prices = _json.loads(prices_raw)
+                                        else:
+                                            prices = prices_raw.split(",")
+                                    else:
+                                        prices = prices_raw
                                     up_price = float(prices[0])
                                     down_price = float(prices[1])
                                 except Exception:
