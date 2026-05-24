@@ -87,7 +87,7 @@ class MarkovModel:
 
     def has_enough_data(self) -> bool:
         """Check if we have enough observations for reliable estimates."""
-        return len(self.history) >= 10
+        return len(self.history) >= 5
 
     def reset(self):
         """Clear all history and reset matrix."""
