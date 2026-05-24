@@ -74,10 +74,16 @@ print(f"\n[ORDER] BUY UP @ price=0.50, size=0.5 shares (~$0.25)...")
 print(f"[ORDER] Token: {token_id[:30]}...")
 
 try:
+    from py_clob_client.clob_types import OrderType
     order_args = OrderArgs(
         price=0.50, size=0.5, side="BUY", token_id=token_id,
     )
-    result = client.create_and_post_order(order_args)
+    # Create order first, then post as GTC (Good Till Cancelled)
+    print("[DEBUG] Creating order...")
+    order = client.create_order(order_args)
+    print(f"[DEBUG] Order created: {str(order)[:200]}")
+    print("[DEBUG] Posting order as GTC...")
+    result = client.post_order(order, OrderType.GTC)
     print(f"\n[RESULT] {result}")
     print("\nSUCCESS! Order placed!")
 except Exception as e:
@@ -86,3 +92,11 @@ except Exception as e:
         print("\n[GEOBLOCK] VPN tidak work untuk trading.")
         print("Polymarket detect IP sebagai restricted.")
         print("Coba ganti server VPN ke negara lain (NL/UK/SG/JP)")
+    elif "version" in str(e).lower():
+        print("\n[VERSION] Trying alternative order method...")
+        try:
+            result = client.create_and_post_order(order_args, OrderType.GTC)
+            print(f"[RESULT] {result}")
+            print("\nSUCCESS!")
+        except Exception as e2:
+            print(f"[ERROR2] {e2}")
