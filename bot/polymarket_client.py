@@ -133,35 +133,16 @@ class PolymarketClient:
                         if not event_markets:
                             continue
 
-                        # BTC Up/Down has 2 sub-markets: "Up" and "Down"
-                        # Each has its own clobTokenIds
-                        up_token_id = None
-                        down_token_id = None
-                        up_price = 0.5
-                        down_price = 0.5
-                        question = event.get("title", "")
-                        end_date = None
-                        is_closed = False
+                        # BTC Up/Down: 1 market with 2 clobTokenIds
+                        # clobTokenIds[0] = UP token, clobTokenIds[1] = DOWN token
+                        m = event_markets[0]
 
-                        for m in event_markets:
-                            outcome = str(m.get("groupItemTitle", m.get("outcome", ""))).lower()
-                            clob_ids = m.get("clobTokenIds", [])
-
-                            if m.get("closed", False):
-                                is_closed = True
-                            end_date = m.get("endDate") or end_date
-
-                            if "up" in outcome and clob_ids:
-                                up_token_id = clob_ids[0]
-                                up_price = float(m.get("outcomePrices", "0.5,0.5").split(",")[0]) if m.get("outcomePrices") else 0.5
-                                question = m.get("question", question)
-                            elif "down" in outcome and clob_ids:
-                                down_token_id = clob_ids[0]
-                                down_price = float(m.get("outcomePrices", "0.5,0.5").split(",")[0]) if m.get("outcomePrices") else 0.5
-
-                        # Skip if closed or expired
-                        if is_closed:
+                        # Skip if closed
+                        if m.get("closed", False):
                             continue
+
+                        # Skip if expired
+                        end_date = m.get("endDate", "")
                         if end_date:
                             try:
                                 from datetime import datetime, timezone
@@ -171,17 +152,31 @@ class PolymarketClient:
                             except Exception:
                                 pass
 
-                        if up_token_id and down_token_id:
+                        clob_ids = m.get("clobTokenIds", [])
+                        if len(clob_ids) >= 2:
+                            question = m.get("question", "")
+                            # Parse prices from outcomePrices string "0.52,0.48"
+                            up_price = 0.5
+                            down_price = 0.5
+                            prices_str = m.get("outcomePrices", "")
+                            if prices_str:
+                                try:
+                                    prices = prices_str.split(",")
+                                    up_price = float(prices[0])
+                                    down_price = float(prices[1])
+                                except Exception:
+                                    pass
+
                             print(f"[MARKET] Found: {question[:60]} (slug={slug})")
                             market = {
-                                "id": event.get("id"),
-                                "condition_id": event.get("conditionId", ""),
+                                "id": m.get("id"),
+                                "condition_id": m.get("conditionId", ""),
                                 "question": question,
-                                "yes_token_id": up_token_id,
-                                "no_token_id": down_token_id,
+                                "yes_token_id": clob_ids[0],  # UP token
+                                "no_token_id": clob_ids[1],   # DOWN token
                                 "yes_price": up_price,
                                 "no_price": down_price,
-                                "volume": event.get("volume", 0),
+                                "volume": m.get("volume", 0),
                                 "end_date": end_date,
                             }
                             break
