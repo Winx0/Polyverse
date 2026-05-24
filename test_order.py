@@ -74,16 +74,35 @@ print(f"\n[ORDER] Placing BUY $0.25 on UP token...")
 print(f"[ORDER] Token: {token_id[:30]}...")
 
 try:
-    # Try market order via create_and_post_order
+    # First check what OrderArgs expects
     from py_clob_client.clob_types import OrderArgs, OrderType
+    import inspect
+    print(f"[DEBUG] OrderArgs params: {inspect.signature(OrderArgs)}")
+
+    # Try with price parameter (limit order at market price)
+    # price=0.50 means we pay $0.50 per share
     order_args = OrderArgs(
-        token_id=token_id,
-        amount=amount,
+        price=0.50,
+        size=amount,
         side="BUY",
+        token_id=token_id,
     )
+    print(f"[DEBUG] Order args created successfully")
+
     result = client.create_and_post_order(order_args)
     print(f"\n[RESULT] {result}")
     print("\n SUCCESS! Order placed on Polymarket!")
+except TypeError as e:
+    print(f"\n[ERROR] TypeError: {e}")
+    # Try alternative method
+    try:
+        print("\n[RETRY] Trying create_order + post...")
+        order = client.create_order(order_args)
+        print(f"[DEBUG] Order created: {order}")
+        result = client.post_order(order)
+        print(f"[RESULT] {result}")
+    except Exception as e2:
+        print(f"[ERROR] Retry failed: {e2}")
 except Exception as e:
     print(f"\n[ERROR] {e}")
     print("\n[INFO] This might mean:")
