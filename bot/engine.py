@@ -31,7 +31,8 @@ class TradingEngine:
         self.loop_interval = config.get("LOOP_INTERVAL", 81)
 
         # Initialize components
-        self.markov = MarkovModel(window_size=50)
+        # Use smaller window for faster adaptation to current trend
+        self.markov = MarkovModel(window_size=20)
         self.kelly = KellySizer(
             max_fraction=0.50,
             min_bet=config.get("MIN_BET", 0.10),
@@ -60,6 +61,9 @@ class TradingEngine:
         self.running = False
         self.trades_today = 0
         self.signals_today = 0
+        # Track 5-minute windows for proper Markov updates
+        self.last_window_ts = 0
+        self.window_start_price = None
 
     def start(self):
         """Start the trading loop."""
@@ -125,22 +129,52 @@ class TradingEngine:
 
     def _tick(self):
         """Single iteration of the trading loop."""
-        # 1. Get latest price state
-        state = self.price_feed.update()
-        if state is None:
+        # 1. Get latest price
+        current_price = self.price_feed.get_current_price()
+        if current_price is None:
             return
 
-        # 2. Update Markov model
-        self.markov.add_observation(state)
+        # 2. Track 5-minute windows for Markov model
+        # Each window = 300 seconds. When a new window starts,
+        # resolve the previous one as UP or DOWN.
+        current_ts = int(time.time())
+        current_window = (current_ts // 300) * 300
 
+        if self.last_window_ts == 0:
+            # First tick - initialize
+            self.last_window_ts = current_window
+            self.window_start_price = current_price
+            return
+
+        if current_window > self.last_window_ts:
+            # New 5-minute window started! Resolve the previous window.
+            if self.window_start_price is not None:
+                if current_price >= self.window_start_price:
+                    resolved_state = "UP"
+                else:
+                    resolved_state = "DOWN"
+
+                # Update Markov model with resolved window
+                self.markov.add_observation(resolved_state)
+                matrix = self.markov.get_transition_matrix()
+                print(f"    [WINDOW] Resolved: {resolved_state} | "
+                      f"P(UP|UP)={matrix['P(UP|UP)']:.3f} "
+                      f"P(DN|DN)={matrix['P(DOWN|DOWN)']:.3f} "
+                      f"(history={len(self.markov.history)})")
+
+            # Reset for new window
+            self.last_window_ts = current_window
+            self.window_start_price = current_price
+
+        # 3. Check if we have enough data
         if not self.markov.has_enough_data():
             return
 
-        # 3. Get persistence probability
+        # 4. Get persistence probability for current state
         current_state = self.markov.get_current_state()
         persistence = self.markov.get_persistence_probability(current_state)
 
-        # 4. Check entry conditions
+        # 5. Check entry conditions
         signal = self._evaluate_signal(current_state, persistence)
         self.signals_today += 1
 
