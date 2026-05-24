@@ -1,5 +1,6 @@
-"""Debug script - find what markets are available."""
+"""Debug script - find BTC Up/Down 5m market."""
 import os
+import requests
 from dotenv import load_dotenv
 load_dotenv('.env.bot')
 
@@ -19,49 +20,83 @@ client = ClobClient(
     creds=creds,
 )
 
-print("Fetching markets...")
-resp = client.get_markets()
-print(f"Type: {type(resp)}")
-
-if isinstance(resp, dict):
-    print(f"Keys: {list(resp.keys())}")
-    data = resp.get('data', resp.get('markets', []))
-else:
-    data = resp
-
-print(f"Count: {len(data) if hasattr(data, '__len__') else 'unknown'}")
-
-# Print first 5 markets
-for i, m in enumerate(data):
-    if i >= 5:
-        break
-    if isinstance(m, dict):
-        q = m.get('question', 'NO QUESTION')
-        cid = m.get('condition_id', m.get('conditionId', 'NO ID'))
-        tokens = m.get('tokens', [])
-        print(f"\n--- Market {i} ---")
-        print(f"  Question: {q}")
-        print(f"  ID: {cid}")
-        print(f"  Tokens: {len(tokens)}")
-        if tokens:
-            print(f"  Token0: {tokens[0]}")
+print("=" * 50)
+print("TEST 1: Gamma API - search for BTC crypto markets")
+print("=" * 50)
+try:
+    url = "https://gamma-api.polymarket.com/markets"
+    params = {"closed": "false", "tag": "crypto", "limit": 50}
+    resp = requests.get(url, params=params, timeout=15)
+    print(f"Status: {resp.status_code}")
+    if resp.status_code == 200:
+        markets = resp.json()
+        print(f"Count: {len(markets)}")
+        for m in markets[:10]:
+            q = m.get('question', '')
+            print(f"  - {q[:80]}")
     else:
-        print(f"\n--- Market {i} ---")
-        print(f"  Type: {type(m)}")
-        print(f"  Value: {str(m)[:200]}")
+        print(f"Error: {resp.text[:200]}")
+except Exception as e:
+    print(f"Failed: {e}")
 
-# Search for BTC
-print("\n\n=== SEARCHING FOR BTC ===")
-found = 0
-for m in data:
-    if isinstance(m, dict):
-        q = str(m.get('question', '')).lower()
-        if 'btc' in q or 'bitcoin' in q:
-            found += 1
-            print(f"  FOUND: {m.get('question', '')}")
-            print(f"    Tokens: {m.get('tokens', [])}")
-            if found >= 5:
-                break
+print("\n" + "=" * 50)
+print("TEST 2: Gamma API - search slug 'btc'")
+print("=" * 50)
+try:
+    url = "https://gamma-api.polymarket.com/markets"
+    params = {"closed": "false", "slug_contains": "btc", "limit": 20}
+    resp = requests.get(url, params=params, timeout=15)
+    print(f"Status: {resp.status_code}")
+    if resp.status_code == 200:
+        markets = resp.json()
+        print(f"Count: {len(markets)}")
+        for m in markets[:10]:
+            q = m.get('question', '')
+            s = m.get('slug', '')
+            print(f"  - {q[:60]} | slug={s[:30]}")
+    else:
+        print(f"Error: {resp.text[:200]}")
+except Exception as e:
+    print(f"Failed: {e}")
 
-if found == 0:
-    print("  No BTC markets found in response!")
+print("\n" + "=" * 50)
+print("TEST 3: Gamma events - crypto")
+print("=" * 50)
+try:
+    url = "https://gamma-api.polymarket.com/events"
+    params = {"closed": "false", "tag": "crypto", "limit": 20}
+    resp = requests.get(url, params=params, timeout=15)
+    print(f"Status: {resp.status_code}")
+    if resp.status_code == 200:
+        events = resp.json()
+        print(f"Count: {len(events)}")
+        for e in events[:10]:
+            title = e.get('title', e.get('question', ''))
+            slug = e.get('slug', '')
+            markets = e.get('markets', [])
+            print(f"  - {title[:60]} | markets={len(markets)} | slug={slug[:30]}")
+    else:
+        print(f"Error: {resp.text[:200]}")
+except Exception as e:
+    print(f"Failed: {e}")
+
+print("\n" + "=" * 50)
+print("TEST 4: CLOB /simplified-markets last page")
+print("=" * 50)
+try:
+    url = "https://clob.polymarket.com/simplified-markets"
+    params = {"limit": 10, "order": "id", "ascending": "false"}
+    resp = requests.get(url, params=params, timeout=15)
+    print(f"Status: {resp.status_code}")
+    if resp.status_code == 200:
+        data = resp.json()
+        markets = data.get('data', [])
+        print(f"Count: {len(markets)}")
+        for m in markets[:10]:
+            q = m.get('question', '')
+            cid = m.get('condition_id', '')[:20]
+            print(f"  - {q[:70]} | id={cid}")
+    else:
+        print(f"Error: {resp.text[:200]}")
+except Exception as e:
+    print(f"Failed: {e}")
