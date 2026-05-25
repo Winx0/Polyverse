@@ -185,12 +185,17 @@ class PolymarketClient:
             if self.client and token_id:
                 book = self.client.get_order_book(token_id)
                 if book:
-                    if book.asks and len(book.asks) > 0:
-                        price = float(book.asks[0].price)
+                    # V2 returns dict {asks: [...], bids: [...]}
+                    asks = book.get("asks") if isinstance(book, dict) else getattr(book, "asks", None)
+                    bids = book.get("bids") if isinstance(book, dict) else getattr(book, "bids", None)
+                    if asks and len(asks) > 0:
+                        a = asks[0]
+                        price = float(a.get("price") if isinstance(a, dict) else a.price)
                         if 0.01 < price < 0.99:
                             return price
-                    if book.bids and len(book.bids) > 0:
-                        price = float(book.bids[0].price)
+                    if bids and len(bids) > 0:
+                        b = bids[0]
+                        price = float(b.get("price") if isinstance(b, dict) else b.price)
                         if 0.01 < price < 0.99:
                             return price
         except Exception as e:
