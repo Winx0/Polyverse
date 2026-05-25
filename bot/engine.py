@@ -338,23 +338,16 @@ class TradingEngine:
             "market_name": market_name,
         }
 
-        # Entry conditions — pesan dibuat eksplisit & informatif biar gampang
-        # debug pas di-skip. Format: "<reason> (threshold: X)"
+        # Entry conditions — pesan singkat (cuma label kondisi yang fail).
+        # Detail lengkap dimunculkan di console log dengan format pipe-separated
+        # supaya gampang dibaca & di-grep:
+        #   SKIP - persistence: 0.333 | threshold: 0.40 | edge: -0.162 | state: DOWN
         if persistence < self.min_prob:
-            signal["reason"] = (
-                f"persistence {persistence:.3f} too low "
-                f"(threshold: {self.min_prob:.2f})"
-            )
+            signal["reason"] = "persistence too low"
         elif edge < self.min_edge:
-            signal["reason"] = (
-                f"edge {edge:+.3f} too low "
-                f"(threshold: {self.min_edge:.2f}, p={persistence:.3f} q={market_price:.3f})"
-            )
+            signal["reason"] = "edge too low"
         elif self.bankroll < self.kelly.min_bet:
-            signal["reason"] = (
-                f"bankroll ${self.bankroll:.2f} below min bet "
-                f"(threshold: ${self.kelly.min_bet:.2f})"
-            )
+            signal["reason"] = "bankroll below min bet"
         else:
             signal["action"] = "ENTER"
             signal["reason"] = "all conditions met"
@@ -365,12 +358,20 @@ class TradingEngine:
         # Update dashboard state
         self._update_bot_state(signal)
 
-        status = ">>>" if signal["action"] == "ENTER" else "   "
+        # Console log — format yang konsisten & gampang di-parse:
+        #   ENTER -> persistence | threshold | edge | state | q | reason
+        #   SKIP  -> persistence | threshold | edge | state | q | reason
+        ts = datetime.now().strftime("%H:%M:%S")
+        action = signal["action"]
+        prefix = ">>>" if action == "ENTER" else "   "
         print(
-            f"{status} [{datetime.now().strftime('%H:%M:%S')}] "
-            f"State={state} P={persistence:.3f} "
-            f"Q={market_price:.3f} Edge={edge:.3f} "
-            f"-> {signal['action']} ({signal['reason']})"
+            f"{prefix} [{ts}] {action:5s} - "
+            f"persistence: {persistence:.3f} | "
+            f"threshold: {self.min_prob:.2f} | "
+            f"edge: {edge:+.3f} | "
+            f"state: {state} | "
+            f"q: {market_price:.3f} | "
+            f"{signal['reason']}"
         )
 
         return signal
