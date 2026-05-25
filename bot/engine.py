@@ -19,7 +19,7 @@ from bot.price_feed import BTCPriceFeed
 from bot.polymarket_client import PolymarketClient
 from bot.journal import TradeJournal
 from bot.telegram_notifier import TelegramNotifier
-from bot.balance_sync import get_account_balance
+from bot.balance_sync import get_account_balance, get_collateral_balance
 
 # --- Flask Dashboard Server ---
 flask_app = Flask(__name__)
@@ -95,6 +95,8 @@ class TradingEngine:
         # Tiap entry: list of dict {side, shares, paid, p, edge, order_id, ...}
         # Saat window resolve, semua posisi di window itu di-settle (WIN/LOSS).
         self.open_positions: dict[int, list[dict]] = {}
+        # File untuk persist open_positions supaya gak hilang saat bot restart.
+        self._positions_file = Path("data/open_positions.json")
 
     def start(self):
         """Start the trading loop."""
@@ -118,6 +120,37 @@ class TradingEngine:
             if not self.client.authenticate():
                 print("[ENGINE] Auth failed. Switching to DRY_RUN.")
                 self.dry_run = True
+            else:
+                # Auto-sync bankroll dari CLOB collateral.
+                # Mengabaikan BANKROLL di .env karena bisa stale (saldo udah
+                # berubah sejak file ditulis terakhir kali). CLOB selalu
+                # real-time. Fallback: kalau query gagal, pakai .env.
+                try:
+                    coll = get_collateral_balance(self.client)
+                    if coll is not None and coll > 0:
+                        old = self.bankroll
+                        self.bankroll = coll
+                        print(
+                            f"[ENGINE] Bankroll auto-synced from CLOB: "
+                            f"${old:.2f} -> ${coll:.2f}"
+                        )
+                    elif coll == 0:
+                        print(
+                            f"[ENGINE] CLOB collateral=0. Pakai bankroll dari "
+                            f".env: ${self.bankroll:.2f}"
+                        )
+                    else:
+                        print(
+                            f"[ENGINE] CLOB query gagal. Pakai bankroll dari "
+                            f".env: ${self.bankroll:.2f}"
+                        )
+                except Exception as e:
+                    print(f"[ENGINE] Bankroll sync error: {e}")
+
+        # Load open_positions yang ke-save dari session sebelumnya.
+        # Posisi yang window-nya udah lewat akan ditandai late_at_load=True
+        # supaya pas settle gak double-credit bankroll (CLOB udah include payout).
+        self._load_open_positions()
 
         self.running = True
         self._run_loop()
@@ -417,6 +450,8 @@ class TradingEngine:
                 "shares": taking,
                 "paid": making,
                 "token_id": token_id,
+                "condition_id": market.get("condition_id", ""),
+                "slug": market.get("slug", ""),
                 "entry_price": signal["market_price"],
                 "p": signal["persistence_prob"],
                 "edge": signal["edge"],
@@ -428,6 +463,8 @@ class TradingEngine:
             # Simpan posisi di window saat ini. Window ini akan resolve
             # saat current_ts melewati (last_window_ts + 300).
             self.open_positions.setdefault(self.last_window_ts, []).append(position)
+            # Persist supaya gak hilang kalau bot restart sebelum settle.
+            self._save_open_positions()
 
             # Log fill (bukan exit) — exit di-log nanti pas settle.
             self.journal.log_trade_fill({
@@ -441,6 +478,69 @@ class TradingEngine:
             })
         else:
             print(f"    [LIVE] Order failed: {result}")
+
+    def _save_open_positions(self):
+        """
+        Persist open_positions ke disk supaya bot bisa recover setelah restart.
+
+        Format JSON: {"<window_ts>": [{...pos...}, ...]}
+        Atomic write (tulis ke .tmp dulu, lalu rename) biar gak corrupt
+        kalau kena interrupt di tengah write.
+        """
+        try:
+            self._positions_file.parent.mkdir(parents=True, exist_ok=True)
+            # Convert int keys -> str (JSON requirement)
+            data = {str(k): v for k, v in self.open_positions.items()}
+            tmp = self._positions_file.with_suffix(".tmp")
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2, default=str)
+            tmp.replace(self._positions_file)
+        except Exception as e:
+            print(f"[POSITIONS] Save gagal: {e}")
+
+    def _load_open_positions(self):
+        """
+        Load open_positions dari disk pas startup.
+
+        Posisi yang window-nya udah lewat (current_ts > window_ts + 300)
+        ditandai `late_at_load=True`. Ini penting karena:
+            - Bankroll diinit dari CLOB collateral yang udah include hasil resolve
+            - Kalau kita credit bankroll lagi pas settle -> double counting
+            - Solusi: untuk posisi late_at_load, settle tetap jalan tapi
+              cuma update wins/losses/journal, tidak modify bankroll.
+        """
+        if not self._positions_file.exists():
+            return
+
+        try:
+            with open(self._positions_file, "r") as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"[POSITIONS] Load gagal (file rusak?): {e}")
+            return
+
+        now = time.time()
+        loaded = 0
+        late = 0
+
+        for window_ts_str, positions in data.items():
+            try:
+                window_ts = int(window_ts_str)
+            except ValueError:
+                continue
+
+            for pos in positions:
+                if now > window_ts + 300:
+                    pos["late_at_load"] = True
+                    late += 1
+            self.open_positions.setdefault(window_ts, []).extend(positions)
+            loaded += len(positions)
+
+        if loaded:
+            print(
+                f"[POSITIONS] Loaded {loaded} posisi dari disk "
+                f"({late} udah lewat window, akan settle late)"
+            )
 
     def _settle_window(
         self,
@@ -464,19 +564,56 @@ class TradingEngine:
             - Journal exit (JSON event log + CSV row)
             - Telegram notify
 
-        Catatan: arah BTC pakai harga lokal (Kraken/CoinGecko/Coinbase). Bisa
-        beda tipis dari oracle resmi Polymarket. Untuk tracking internal ini
-        cukup. Kalau mau 100% akurat, bisa di-cross-check ke gamma API
-        market.outcomePrices setelah resolve.
+        Catatan: arah BTC pakai harga lokal (Kraken/CoinGecko/Coinbase). Kita
+        coba CROSS-CHECK ke Polymarket gamma API (oracle resmi) — kalau
+        berhasil, hasil oracle yang dipakai. Kalau market belum closed di
+        Polymarket atau query gagal, fallback ke harga lokal.
+
+        Posisi dengan flag `late_at_load=True` (di-load dari disk pas startup,
+        dan window-nya udah lewat saat itu) tetap di-settle untuk update
+        statistik & journal, TAPI bankroll TIDAK dimodifikasi karena CLOB
+        collateral pas startup udah include hasil resolve.
         """
         positions = self.open_positions.pop(window_ts, [])
         if not positions:
             return
 
+        # Setelah pop, simpan state baru ke disk
+        self._save_open_positions()
+
+        # Cross-check ke Polymarket oracle (sumber truth lebih akurat
+        # daripada price feed lokal). Pakai condition_id dari posisi pertama
+        # (semua posisi di 1 window pasti di market yang sama).
+        local_state = resolved_state
+        oracle_state: str | None = None
+        if self.client and not self.dry_run:
+            cid = positions[0].get("condition_id", "")
+            slug = positions[0].get("slug", "")
+            if cid or slug:
+                oracle_state = self.client.get_market_resolution(
+                    condition_id=cid, slug=slug
+                )
+
+        if oracle_state and oracle_state != local_state:
+            print(
+                f"    [ORACLE] Polymarket resolve: {oracle_state} | "
+                f"lokal bilang: {local_state} | pakai oracle ✓"
+            )
+            resolved_state = oracle_state
+        elif oracle_state:
+            # match — confidence boost, gak perlu print
+            pass
+        elif self.client and not self.dry_run:
+            print(
+                f"    [ORACLE] belum resolve / query gagal, fallback ke "
+                f"harga lokal ({local_state})"
+            )
+
         for pos in positions:
             side = pos["side"]
             shares = pos["shares"]
             paid = pos["paid"]
+            is_late = pos.get("late_at_load", False)
 
             won = (
                 (side == "YES" and resolved_state == "UP")
@@ -486,12 +623,19 @@ class TradingEngine:
             if won:
                 payout = shares * 1.0  # tiap winning share = $1.00
                 pnl = payout - paid
-                self.bankroll += payout
+                # Hanya credit bankroll kalau posisi ini ENTRY dalam session
+                # ini (bukan posisi yang di-load dari disk dan udah ke-resolve
+                # di Polymarket — bankroll udah include payout via CLOB init).
+                if not is_late:
+                    self.bankroll += payout
                 self.wins += 1
                 outcome = "WIN"
             else:
                 payout = 0.0
                 pnl = -paid
+                # Loss: paid sudah ke-debit di entry (atau, kalau is_late,
+                # paid sudah ke-debit langsung di Polymarket dan reflected
+                # di CLOB pas init). Either way, bankroll gak diapa-apain.
                 self.losses += 1
                 outcome = "LOSS"
 
@@ -507,6 +651,8 @@ class TradingEngine:
                 "paid": round(paid, 4),
                 "payout": round(payout, 4),
                 "resolved_state": resolved_state,
+                "resolved_by": "oracle" if oracle_state else "local",
+                "late_at_load": is_late,
                 "start_price": round(start_price, 2),
                 "end_price": round(end_price, 2),
                 "window_ts": window_ts,
@@ -532,8 +678,9 @@ class TradingEngine:
 
             # 4. Console summary
             emoji = "🟢 WIN " if won else "🔴 LOSS"
+            late_tag = " [LATE]" if is_late else ""
             print(
-                f"    <<< {emoji} {side} | shares={shares:.2f} "
+                f"    <<< {emoji} {side}{late_tag} | shares={shares:.2f} "
                 f"paid=${paid:.2f} payout=${payout:.2f} "
                 f"P/L=${pnl:+.4f} | Bankroll: ${self.bankroll:.2f}"
             )

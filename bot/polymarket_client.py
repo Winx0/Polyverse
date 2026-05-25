@@ -165,6 +165,7 @@ class PolymarketClient:
                     "no_price": down_price,
                     "volume": m.get("volume", 0),
                     "end_date": end_date,
+                    "slug": slug,
                 }
                 print(f"[MARKET] {market['question'][:50]} | UP={up_price:.3f} DOWN={down_price:.3f}")
                 break
@@ -232,4 +233,95 @@ class PolymarketClient:
             return None
         except Exception as e:
             print(f"[ORDER] Error: {str(e)[:200]}")
+            return None
+
+    def get_market_resolution(
+        self, condition_id: str = "", slug: str = ""
+    ) -> str | None:
+        """
+        Query arah resolved market dari Polymarket gamma API.
+
+        Pakai ini sebagai source of truth untuk WIN/LOSS — lebih akurat
+        daripada price feed lokal (Kraken/CoinGecko) yang bisa beda dari
+        oracle resmi Polymarket.
+
+        Returns:
+            "UP"   kalau outcome YES menang (yes_price ≈ 1.0)
+            "DOWN" kalau outcome NO menang  (no_price  ≈ 1.0)
+            None   kalau market belum resolve / query gagal / ambiguous
+        """
+        if not condition_id and not slug:
+            return None
+
+        try:
+            if condition_id:
+                # Endpoint /markets dengan filter condition_ids
+                r = self.session.get(
+                    f"{self.GAMMA_HOST}/markets",
+                    params={"condition_ids": condition_id},
+                    timeout=10,
+                )
+            else:
+                # Fallback ke events dengan slug
+                r = self.session.get(
+                    f"{self.GAMMA_HOST}/events",
+                    params={"slug": slug},
+                    timeout=10,
+                )
+
+            if r.status_code != 200:
+                return None
+
+            data = r.json()
+            if not data:
+                return None
+
+            # /markets return list of market dicts; /events return list of event,
+            # tiap event punya 'markets' list.
+            if condition_id:
+                m = data[0] if isinstance(data, list) else data
+            else:
+                ev = data[0] if isinstance(data, list) else data
+                m = (ev.get("markets") or [{}])[0]
+
+            # Belum resolve kalau closed=False
+            if not m.get("closed"):
+                return None
+
+            prices_raw = m.get("outcomePrices", "")
+            if not prices_raw:
+                return None
+
+            # outcomePrices bisa string JSON, comma-separated, atau list
+            if isinstance(prices_raw, str):
+                try:
+                    if prices_raw.strip().startswith("["):
+                        prices = json.loads(prices_raw)
+                    else:
+                        prices = prices_raw.split(",")
+                except Exception:
+                    return None
+            else:
+                prices = prices_raw
+
+            if len(prices) < 2:
+                return None
+
+            try:
+                yes_price = float(prices[0])
+                no_price = float(prices[1])
+            except (ValueError, TypeError):
+                return None
+
+            # Resolved markets selalu 1.0 / 0.0 (binary). Threshold 0.99
+            # untuk safety kalau ada rounding.
+            if yes_price >= 0.99:
+                return "UP"
+            if no_price >= 0.99:
+                return "DOWN"
+
+            return None
+
+        except Exception as e:
+            print(f"[ORACLE] resolution query gagal: {str(e)[:120]}")
             return None
