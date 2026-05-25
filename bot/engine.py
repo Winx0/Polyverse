@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from threading import Thread
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, send_from_directory
 
 from bot.markov import MarkovModel
 from bot.kelly import KellySizer
@@ -19,6 +19,7 @@ from bot.price_feed import BTCPriceFeed
 from bot.polymarket_client import PolymarketClient
 from bot.journal import TradeJournal
 from bot.telegram_notifier import TelegramNotifier
+from bot.balance_sync import get_pusd_balance
 
 # --- Flask Dashboard Server ---
 flask_app = Flask(__name__)
@@ -30,7 +31,7 @@ def get_state():
 
 @flask_app.route('/')
 def index():
-    return '<meta http-equiv="refresh" content="0;url=/state">'
+    return send_from_directory(str(Path(__file__).parent), 'dashboard.html')
 
 def _run_flask():
     flask_app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
@@ -395,8 +396,25 @@ class TradingEngine:
         """Update global bot_state for Flask dashboard and write to file."""
         global bot_state
         matrix = self.markov.get_transition_matrix()
+
+        # Sync on-chain pUSD balance every 30s if live mode
+        onchain_bal = 0.0
+        if not self.dry_run and self.config.get("SAFE_ADDRESS"):
+            now = time.time()
+            if now - getattr(self, '_last_balance_sync', 0) > 30:
+                onchain_bal = get_pusd_balance(self.config.get("SAFE_ADDRESS"))
+                self._last_balance_sync = now
+                self._cached_onchain = onchain_bal
+                # Auto-update bankroll from on-chain (real source of truth)
+                if onchain_bal > 0:
+                    self.bankroll = onchain_bal
+            else:
+                onchain_bal = getattr(self, '_cached_onchain', 0.0)
+
         bot_state = {
             "bankroll": round(self.bankroll, 4),
+            "onchain_balance": round(onchain_bal, 4),
+            "funder": self.config.get("SAFE_ADDRESS", ""),
             "state": signal["state"],
             "p": round(signal["persistence_prob"], 4),
             "q": round(signal["market_price"], 4),
