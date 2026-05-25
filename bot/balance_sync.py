@@ -27,9 +27,13 @@ def get_pusd_balance(wallet_address: str) -> float:
             timeout=8,
         )
         if response.status_code == 200:
-            result = response.json().get("result", "0x0")
-            if result and result != "0x0":
-                return int(result, 16) / 1e6  # pUSD has 6 decimals
-    except Exception as e:
-        print(f"[BALANCE] Sync error: {str(e)[:80]}")
+            result = response.json().get("result", "")
+            # Handle empty/invalid responses gracefully
+            if result and result not in ("0x", "0x0", ""):
+                try:
+                    return int(result, 16) / 1e6  # pUSD has 6 decimals
+                except ValueError:
+                    pass
+    except Exception:
+        pass  # Silent fail - balance sync is non-critical
     return 0.0
