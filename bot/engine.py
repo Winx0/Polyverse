@@ -57,7 +57,7 @@ class TradingEngine:
         self.markov = MarkovModel(window_size=20)
         self.kelly = KellySizer(
             max_fraction=0.50,
-            min_bet=config.get("MIN_BET", 0.10),
+            min_bet=config.get("MIN_BET", 1.00),
             max_bet=config.get("MAX_BET", 2.00),
         )
         self.price_feed = BTCPriceFeed(interval="5m")
@@ -351,7 +351,7 @@ class TradingEngine:
             self.losses += 1
 
     def _live_execute(self, signal: dict, bet_size: float):
-        """Execute real trade on Polymarket."""
+        """Execute real trade on Polymarket V2 deposit wallet."""
         if not self.client:
             print("    [LIVE] No client available")
             return
@@ -361,15 +361,35 @@ class TradingEngine:
             print("    [LIVE] No market found")
             return
 
-        side = "YES" if signal["state"] == "UP" else "NO"
-        token_id = market["yes_token_id"] if side == "YES" else market["no_token_id"]
+        # We always BUY a YES token: if state=UP we buy UP token, if DOWN we buy DOWN token
+        side = "BUY"
+        token_id = market["yes_token_id"] if signal["state"] == "UP" else market["no_token_id"]
 
-        result = self.client.place_market_order(token_id, bet_size, "BUY")
+        # Polymarket V2 minimum order is ~$1.00 USD (5 shares @ $0.20 minimum).
+        # bet_size is already in USD.
+        if bet_size < 1.0:
+            print(f"    [LIVE] bet_size ${bet_size:.2f} < $1 minimum, skipping")
+            return
 
-        if result:
-            print(f"    [LIVE] Order placed: {result}")
+        result = self.client.place_market_order(token_id, bet_size, side)
+
+        if result and isinstance(result, dict) and result.get("success"):
+            taking = float(result.get("takingAmount", 0))
+            making = float(result.get("makingAmount", 0))
+            print(f"    [LIVE] FILLED ✓ paid ${making:.4f} → got {taking:.4f} shares")
+            # Update bankroll based on actual fill
+            self.bankroll -= making
+            self.journal.log_trade_exit({
+                "outcome": "PENDING",  # Will resolve at window end
+                "pnl": 0,
+                "bankroll_after": round(self.bankroll, 4),
+                "order_id": result.get("orderID", ""),
+                "tx_hash": (result.get("transactionsHashes", []) or [""])[0],
+                "shares": taking,
+                "paid": making,
+            })
         else:
-            print(f"    [LIVE] Order failed")
+            print(f"    [LIVE] Order failed: {result}")
 
     def _update_bot_state(self, signal: dict):
         """Update global bot_state for Flask dashboard and write to file."""
