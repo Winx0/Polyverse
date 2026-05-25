@@ -49,9 +49,10 @@ class TradingEngine:
         self.config = config
         self.dry_run = config.get("DRY_RUN", True)
         self.min_edge = config.get("MIN_EDGE", 0.05)
-        # MIN_PROB diturunkan ke 0.40 — observasi: BTC 5m sering anti-persistent,
-        # persistence 0.20-0.40 muncul dominan. Threshold 0.55+ bikin bot
-        # kelaparan (semua di-skip). User bisa override di .env.
+        # MIN_PROB sekarang diterapkan ke EFFECTIVE probability (bukan raw
+        # persistence). Di dual-mode, effective_p = max(persistence, 1-persistence)
+        # tergantung side yang dipilih. Jadi 0.40 = "minimal 40% peluang menang
+        # sesuai arah taruhan kita".
         self.min_prob = config.get("MIN_PROB", 0.40)
         self.bankroll = config.get("BANKROLL", 2.0)
         self.loop_interval = config.get("LOOP_INTERVAL", 81)
@@ -59,6 +60,18 @@ class TradingEngine:
         # dan invalidate market cache (force re-discover slug Polymarket).
         # Default 45 menit = 9 windows BTC 5m.
         self.stale_minutes = int(config.get("STALE_MINUTES", 45))
+        # STRATEGY_MODE — handle anti-persistence (mean reversion) signal.
+        #   "trend"      = bet sama arah dengan persistence (logic original).
+        #                  Cocok kalau BTC trending (P(UP|UP) atau P(DN|DN) > 0.5)
+        #   "contrarian" = bet ARAH BERLAWANAN dengan persistence (anti-persistence).
+        #                  Cocok kalau BTC mean-reverting (persistence < 0.5)
+        #   "auto"       = engine pilih sendiri arah dgn edge terbesar (default).
+        #                  Untuk BTC 5m yang sering anti-persistent, ini akan
+        #                  mostly milih contrarian.
+        self.strategy_mode = config.get("STRATEGY_MODE", "auto").lower()
+        if self.strategy_mode not in ("trend", "contrarian", "auto"):
+            print(f"[ENGINE] STRATEGY_MODE='{self.strategy_mode}' invalid, fallback ke 'auto'")
+            self.strategy_mode = "auto"
 
         # Initialize components
         # Use smaller window for faster adaptation to current trend
@@ -116,9 +129,10 @@ class TradingEngine:
         print(f"\n{'='*50}")
         print(f"  POLYMARKET BTC UP/DOWN BOT")
         print(f"  Mode: {mode}")
+        print(f"  Strategy: {self.strategy_mode.upper()}")
         print(f"  Bankroll: ${self.bankroll:.2f}")
         print(f"  Min Edge: {self.min_edge:.0%}")
-        print(f"  Min Persistence: {self.min_prob:.0%}")
+        print(f"  Min Effective Prob: {self.min_prob:.0%}")
         print(f"  Loop Interval: {self.loop_interval}s")
         print(f"{'='*50}\n")
 
@@ -306,44 +320,108 @@ class TradingEngine:
                     pass
 
     def _evaluate_signal(self, state: str, persistence: float) -> dict:
-        """Evaluate whether to enter a trade."""
-        # Simulate market price (in dry run) or fetch real
-        market_price = 0.50  # Default
+        """
+        Evaluate signal dengan dual-mode logic.
+
+        Untuk tiap tick:
+            1. Hitung edge untuk ARAH TREND (bet sama dengan state, p=persistence)
+            2. Hitung edge untuk ARAH CONTRARIAN (bet lawan state, p=1-persistence)
+            3. Pilih arah berdasarkan strategy_mode:
+                - "trend"      -> selalu trend
+                - "contrarian" -> selalu contrarian
+                - "auto"       -> arah dengan edge terbesar
+            4. Apply filter MIN_PROB & MIN_EDGE ke arah yang dipilih.
+
+        Untuk binary market BTC Up/Down:
+            - State=UP, persistence=P(UP|UP)=0.30 -> P(DOWN next)=0.70
+              * Trend bet     : YES @ q_yes,  effective_p=0.30
+              * Contrarian bet: NO  @ q_no,   effective_p=0.70
+            - State=DOWN, persistence=P(DN|DN)=0.30 -> P(UP next)=0.70
+              * Trend bet     : NO  @ q_no,   effective_p=0.30
+              * Contrarian bet: YES @ q_yes,  effective_p=0.70
+
+        Side yang di-bet (`bet_side`) tetap di-track sebagai YES/NO supaya
+        settle logic gak perlu diubah (YES menang kalau resolve UP, dst).
+        """
+        # --- 1. Ambil harga kedua sisi market (YES & NO) ---
         market_name = ""
+        market = None
+        yes_price = 0.50
+        no_price = 0.50
 
         if self.client and not self.dry_run:
             market = self.client.find_btc_market()
             if market:
-                side = "YES" if state == "UP" else "NO"
-                market_price = self.client.get_market_price(market, side)
+                yes_price = self.client.get_market_price(market, "YES")
+                no_price = self.client.get_market_price(market, "NO")
                 market_name = market.get("question", "")
+                # Sanity: harga binary market harusnya sum ≈ 1.0. Kalau salah
+                # satu gagal di-fetch (return 0.5 default) tapi yang lain valid,
+                # derive dari yang valid.
+                if abs(yes_price + no_price - 1.0) > 0.10:
+                    if abs(yes_price - 0.5) > abs(no_price - 0.5):
+                        no_price = round(1.0 - yes_price, 4)
+                    else:
+                        yes_price = round(1.0 - no_price, 4)
         else:
-            # In dry run, simulate market price based on persistence
-            # Market usually prices between 0.45-0.65
+            # Dry run: simulasi harga binary market (sum ≈ 1.0)
             import random
-            market_price = 0.45 + random.random() * 0.20
+            yes_price = 0.45 + random.random() * 0.20
+            no_price = round(1.0 - yes_price, 4)
             market_name = "DRY RUN (simulated)"
 
-        # Calculate edge
-        edge = persistence - market_price
+        # --- 2. Hitung edge untuk dua arah ---
+        # Trend: bet sama arah dengan state (bet on persistence direction)
+        if state == "UP":
+            p_trend, q_trend, side_trend = persistence, yes_price, "YES"
+        else:  # DOWN
+            p_trend, q_trend, side_trend = persistence, no_price, "NO"
+        edge_trend = p_trend - q_trend
 
-        # Build signal
+        # Contrarian: bet arah berlawanan (anti-persistence / mean revert)
+        if state == "UP":
+            p_cont, q_cont, side_cont = 1.0 - persistence, no_price, "NO"
+        else:  # DOWN
+            p_cont, q_cont, side_cont = 1.0 - persistence, yes_price, "YES"
+        edge_cont = p_cont - q_cont
+
+        # --- 3. Pilih arah berdasarkan strategy_mode ---
+        if self.strategy_mode == "trend":
+            chosen_mode = "trend"
+            eff_p, eff_q, bet_side, edge = p_trend, q_trend, side_trend, edge_trend
+        elif self.strategy_mode == "contrarian":
+            chosen_mode = "contrarian"
+            eff_p, eff_q, bet_side, edge = p_cont, q_cont, side_cont, edge_cont
+        else:  # auto: pilih edge terbesar
+            if edge_trend >= edge_cont:
+                chosen_mode = "trend"
+                eff_p, eff_q, bet_side, edge = p_trend, q_trend, side_trend, edge_trend
+            else:
+                chosen_mode = "contrarian"
+                eff_p, eff_q, bet_side, edge = p_cont, q_cont, side_cont, edge_cont
+
+        # --- 4. Build signal dict ---
         signal = {
             "state": state,
             "persistence_prob": persistence,
-            "market_price": market_price,
+            "yes_price": yes_price,
+            "no_price": no_price,
+            "bet_side": bet_side,            # "YES" atau "NO" — token yg di-buy
+            "effective_p": eff_p,            # prob menang sesuai arah bet
+            "effective_q": eff_q,            # harga token yg di-buy
             "edge": edge,
+            "edge_trend": edge_trend,
+            "edge_contrarian": edge_cont,
+            "strategy": chosen_mode,         # "trend" atau "contrarian"
+            "market_price": eff_q,           # backward-compat (untuk Kelly etc)
+            "market_name": market_name,
             "action": "SKIP",
             "reason": "",
-            "market_name": market_name,
         }
 
-        # Entry conditions — pesan singkat (cuma label kondisi yang fail).
-        # Detail lengkap dimunculkan di console log dengan format pipe-separated
-        # supaya gampang dibaca & di-grep:
-        #   SKIP - persistence: 0.333 | threshold: 0.40 | edge: -0.162 | state: DOWN
-        if persistence < self.min_prob:
-            signal["reason"] = "persistence too low"
+        # --- 5. Apply filter ---
+        if eff_p < self.min_prob:
+            signal["reason"] = "effective_p too low"
         elif edge < self.min_edge:
             signal["reason"] = "edge too low"
         elif self.bankroll < self.kelly.min_bet:
@@ -352,36 +430,37 @@ class TradingEngine:
             signal["action"] = "ENTER"
             signal["reason"] = "all conditions met"
 
-        # Log signal
+        # Log signal (journal + dashboard)
         self.journal.log_signal(signal)
-
-        # Update dashboard state
         self._update_bot_state(signal)
 
-        # Console log — format yang konsisten & gampang di-parse:
-        #   ENTER -> persistence | threshold | edge | state | q | reason
-        #   SKIP  -> persistence | threshold | edge | state | q | reason
+        # Console log — pipe-separated, tampilkan kedua edge biar gampang
+        # validasi keputusan strategy=auto:
         ts = datetime.now().strftime("%H:%M:%S")
         action = signal["action"]
         prefix = ">>>" if action == "ENTER" else "   "
         print(
-            f"{prefix} [{ts}] {action:5s} - "
-            f"persistence: {persistence:.3f} | "
+            f"{prefix} [{ts}] {action:5s} [{chosen_mode}] - "
+            f"p_eff: {eff_p:.3f} | "
             f"threshold: {self.min_prob:.2f} | "
             f"edge: {edge:+.3f} | "
+            f"side: {bet_side} | "
             f"state: {state} | "
-            f"q: {market_price:.3f} | "
+            f"q: {eff_q:.3f} | "
+            f"e_trend: {edge_trend:+.3f} e_cont: {edge_cont:+.3f} | "
             f"{signal['reason']}"
         )
 
         return signal
 
     def _execute_trade(self, signal: dict):
-        """Execute a trade based on the signal."""
-        p = signal["persistence_prob"]
-        q = signal["market_price"]
+        """Execute a trade based on the signal (dual-mode aware)."""
+        # Pakai effective_p & effective_q (sudah dipilih di _evaluate_signal
+        # sesuai strategy mode trend/contrarian).
+        p = signal["effective_p"]
+        q = signal["effective_q"]
 
-        # Calculate position size
+        # Calculate position size pakai Kelly atas effective_p & effective_q
         bet_size = self.kelly.calculate_bet_size(p, q, self.bankroll)
 
         if bet_size <= 0:
@@ -389,9 +468,12 @@ class TradingEngine:
             return
 
         ev = self.kelly.calculate_expected_value(p, q, bet_size)
-        side = "YES" if signal["state"] == "UP" else "NO"
+        side = signal["bet_side"]  # YES atau NO — sudah final dari evaluate
 
-        print(f"    >>> ENTRY: {side} @ {q:.3f} | Bet: ${bet_size:.2f} | EV: ${ev:.4f}")
+        print(
+            f"    >>> ENTRY: {side} @ {q:.3f} | Bet: ${bet_size:.2f} | "
+            f"EV: ${ev:.4f} | strategy: {signal['strategy']}"
+        )
 
         # Log entry
         self.journal.log_trade_entry({
@@ -400,7 +482,9 @@ class TradingEngine:
             "bet_size": bet_size,
             "kelly_fraction": self.kelly.calculate_kelly_fraction(p, q),
             "markov_state": signal["state"],
-            "persistence_prob": p,
+            "persistence_prob": signal["persistence_prob"],
+            "effective_p": p,
+            "strategy": signal["strategy"],
             "expected_value": ev,
         })
 
@@ -416,18 +500,17 @@ class TradingEngine:
         self.trades_today += 1
 
     def _simulate_outcome(self, signal: dict, bet_size: float):
-        """Simulate trade outcome for DRY_RUN mode."""
+        """Simulate trade outcome for DRY_RUN mode (dual-mode aware)."""
         import random
 
-        # Use persistence probability as the actual win chance
-        p = signal["persistence_prob"]
+        # Effective probability — udah disesuaikan strategy mode
+        # (trend pakai persistence, contrarian pakai 1-persistence).
+        p = signal["effective_p"]
+        q = signal["effective_q"]
         won = random.random() < p
 
         if won:
-            q = signal["market_price"]
-            shares = bet_size / q
-            pnl = shares * (1 - q) - bet_size + bet_size  # profit
-            pnl = bet_size * ((1 - q) / q)  # simplified
+            pnl = bet_size * ((1 - q) / q)  # profit kalau menang
             outcome = "WIN"
         else:
             pnl = -bet_size
@@ -452,13 +535,10 @@ class TradingEngine:
 
     def _live_execute(self, signal: dict, bet_size: float):
         """
-        Execute real trade on Polymarket V2 deposit wallet.
+        Execute real trade on Polymarket V2 deposit wallet (dual-mode aware).
 
-        Catatan penting: di mode LIVE, exit TIDAK di-log di sini.
-        Posisi disimpan ke `self.open_positions[window_ts]` dan baru di-settle
-        saat window 5-menit resolve (lihat `_settle_window`). Ini fix bug lama
-        di mana wins/losses gak pernah ke-counter dan bankroll gak di-credit
-        saat menang.
+        bet_side dari signal udah final (YES atau NO). Pilih token_id sesuai.
+        Di dual-mode, bet_side bisa NO walaupun state=UP (contrarian).
         """
         if not self.client:
             print("    [LIVE] No client available")
@@ -469,12 +549,14 @@ class TradingEngine:
             print("    [LIVE] No market found")
             return
 
-        # We always BUY a YES token: if state=UP we buy UP token, if DOWN we buy DOWN token
         side = "BUY"
-        token_id = market["yes_token_id"] if signal["state"] == "UP" else market["no_token_id"]
+        # Pakai bet_side dari signal langsung, BUKAN derive dari state.
+        if signal["bet_side"] == "YES":
+            token_id = market["yes_token_id"]
+        else:
+            token_id = market["no_token_id"]
 
-        # Polymarket V2 minimum order is ~$1.00 USD (5 shares @ $0.20 minimum).
-        # bet_size is already in USD.
+        # Polymarket V2 minimum order is ~$1.00 USD.
         if bet_size < 1.0:
             print(f"    [LIVE] bet_size ${bet_size:.2f} < $1 minimum, skipping")
             return
@@ -482,15 +564,12 @@ class TradingEngine:
         result = self.client.place_market_order(token_id, bet_size, side)
 
         if result and isinstance(result, dict) and result.get("success"):
-            taking = float(result.get("takingAmount", 0))  # shares received
-            making = float(result.get("makingAmount", 0))  # USD paid
+            taking = float(result.get("takingAmount", 0))
+            making = float(result.get("makingAmount", 0))
             print(f"    [LIVE] FILLED ✓ paid ${making:.4f} → got {taking:.4f} shares")
 
-            # Debit bankroll segera (USD keluar dari akun saat order matched).
-            # Credit (kalau menang) akan dilakukan di _settle_window.
             self.bankroll -= making
 
-            side_yn = "YES" if signal["state"] == "UP" else "NO"
             order_id = result.get("orderID", "") or result.get("order_id", "")
             tx_hash = ""
             tx_list = result.get("transactionsHashes", []) or result.get("transaction_hashes", [])
@@ -498,34 +577,33 @@ class TradingEngine:
                 tx_hash = tx_list[0]
 
             position = {
-                "side": side_yn,
+                "side": signal["bet_side"],   # YES atau NO — udah final
                 "shares": taking,
                 "paid": making,
                 "token_id": token_id,
                 "condition_id": market.get("condition_id", ""),
                 "slug": market.get("slug", ""),
-                "entry_price": signal["market_price"],
-                "p": signal["persistence_prob"],
+                "entry_price": signal["effective_q"],
+                "p": signal["effective_p"],
                 "edge": signal["edge"],
+                "strategy": signal["strategy"],   # "trend" atau "contrarian"
+                "markov_state": signal["state"],  # state pas entry
                 "order_id": order_id,
                 "tx_hash": tx_hash,
                 "market": signal.get("market_name", ""),
                 "entry_time": datetime.now().isoformat(),
             }
-            # Simpan posisi di window saat ini. Window ini akan resolve
-            # saat current_ts melewati (last_window_ts + 300).
             self.open_positions.setdefault(self.last_window_ts, []).append(position)
-            # Persist supaya gak hilang kalau bot restart sebelum settle.
             self._save_open_positions()
 
-            # Log fill (bukan exit) — exit di-log nanti pas settle.
             self.journal.log_trade_fill({
                 "window_ts": self.last_window_ts,
-                "side": side_yn,
+                "side": signal["bet_side"],
                 "shares": taking,
                 "paid": making,
                 "order_id": order_id,
                 "tx_hash": tx_hash,
+                "strategy": signal["strategy"],
                 "bankroll_after_entry": round(self.bankroll, 4),
             })
         else:
@@ -710,6 +788,8 @@ class TradingEngine:
                 "window_ts": window_ts,
                 "p": round(pos.get("p", 0), 4),
                 "edge": round(pos.get("edge", 0), 4),
+                "strategy": pos.get("strategy", ""),
+                "markov_state": pos.get("markov_state", ""),
                 "order_id": pos.get("order_id", ""),
                 "tx_hash": pos.get("tx_hash", ""),
                 "market": pos.get("market", ""),
@@ -731,9 +811,10 @@ class TradingEngine:
             # 4. Console summary
             emoji = "🟢 WIN " if won else "🔴 LOSS"
             late_tag = " [LATE]" if is_late else ""
+            strategy = pos.get("strategy", "?")
             print(
-                f"    <<< {emoji} {side}{late_tag} | shares={shares:.2f} "
-                f"paid=${paid:.2f} payout=${payout:.2f} "
+                f"    <<< {emoji} {side}{late_tag} [{strategy}] | "
+                f"shares={shares:.2f} paid=${paid:.2f} payout=${payout:.2f} "
                 f"P/L=${pnl:+.4f} | Bankroll: ${self.bankroll:.2f}"
             )
 
@@ -780,8 +861,16 @@ class TradingEngine:
             "funder": self.config.get("SAFE_ADDRESS", ""),
             "state": signal["state"],
             "p": round(signal["persistence_prob"], 4),
-            "q": round(signal["market_price"], 4),
+            "p_eff": round(signal.get("effective_p", signal["persistence_prob"]), 4),
+            "q": round(signal.get("effective_q", signal.get("market_price", 0.5)), 4),
+            "yes_price": round(signal.get("yes_price", 0.5), 4),
+            "no_price": round(signal.get("no_price", 0.5), 4),
             "edge": round(signal["edge"], 4),
+            "edge_trend": round(signal.get("edge_trend", 0), 4),
+            "edge_contrarian": round(signal.get("edge_contrarian", 0), 4),
+            "strategy": signal.get("strategy", "n/a"),
+            "strategy_mode": self.strategy_mode,
+            "bet_side": signal.get("bet_side", "n/a"),
             "action": signal["action"],
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "wins": self.wins,
