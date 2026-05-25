@@ -19,7 +19,7 @@ from bot.price_feed import BTCPriceFeed
 from bot.polymarket_client import PolymarketClient
 from bot.journal import TradeJournal
 from bot.telegram_notifier import TelegramNotifier
-from bot.balance_sync import get_pusd_balance
+from bot.balance_sync import get_account_balance
 
 # --- Flask Dashboard Server ---
 flask_app = Flask(__name__)
@@ -91,6 +91,10 @@ class TradingEngine:
         # Track 5-minute windows for proper Markov updates
         self.last_window_ts = 0
         self.window_start_price = None
+        # Posisi live yang belum di-settle, di-key per window_ts.
+        # Tiap entry: list of dict {side, shares, paid, p, edge, order_id, ...}
+        # Saat window resolve, semua posisi di window itu di-settle (WIN/LOSS).
+        self.open_positions: dict[int, list[dict]] = {}
 
     def start(self):
         """Start the trading loop."""
@@ -195,6 +199,16 @@ class TradingEngine:
                       f"P(UP|UP)={matrix['P(UP|UP)']:.3f} "
                       f"P(DN|DN)={matrix['P(DOWN|DOWN)']:.3f} "
                       f"(history={len(self.markov.history)})")
+
+                # Settle posisi live yang taruhannya di window ini.
+                # Harus dipanggil SETELAH Markov diupdate (biar urutan log rapi)
+                # dan SEBELUM last_window_ts diganti (biar match key).
+                self._settle_window(
+                    window_ts=self.last_window_ts,
+                    resolved_state=resolved_state,
+                    start_price=self.window_start_price,
+                    end_price=current_price,
+                )
 
             # Reset for new window
             self.last_window_ts = current_window
@@ -352,7 +366,15 @@ class TradingEngine:
             self.losses += 1
 
     def _live_execute(self, signal: dict, bet_size: float):
-        """Execute real trade on Polymarket V2 deposit wallet."""
+        """
+        Execute real trade on Polymarket V2 deposit wallet.
+
+        Catatan penting: di mode LIVE, exit TIDAK di-log di sini.
+        Posisi disimpan ke `self.open_positions[window_ts]` dan baru di-settle
+        saat window 5-menit resolve (lihat `_settle_window`). Ini fix bug lama
+        di mana wins/losses gak pernah ke-counter dan bankroll gak di-credit
+        saat menang.
+        """
         if not self.client:
             print("    [LIVE] No client available")
             return
@@ -375,45 +397,187 @@ class TradingEngine:
         result = self.client.place_market_order(token_id, bet_size, side)
 
         if result and isinstance(result, dict) and result.get("success"):
-            taking = float(result.get("takingAmount", 0))
-            making = float(result.get("makingAmount", 0))
+            taking = float(result.get("takingAmount", 0))  # shares received
+            making = float(result.get("makingAmount", 0))  # USD paid
             print(f"    [LIVE] FILLED ✓ paid ${making:.4f} → got {taking:.4f} shares")
-            # Update bankroll based on actual fill
+
+            # Debit bankroll segera (USD keluar dari akun saat order matched).
+            # Credit (kalau menang) akan dilakukan di _settle_window.
             self.bankroll -= making
-            self.journal.log_trade_exit({
-                "outcome": "PENDING",  # Will resolve at window end
-                "pnl": 0,
-                "bankroll_after": round(self.bankroll, 4),
-                "order_id": result.get("orderID", ""),
-                "tx_hash": (result.get("transactionsHashes", []) or [""])[0],
+
+            side_yn = "YES" if signal["state"] == "UP" else "NO"
+            order_id = result.get("orderID", "") or result.get("order_id", "")
+            tx_hash = ""
+            tx_list = result.get("transactionsHashes", []) or result.get("transaction_hashes", [])
+            if tx_list:
+                tx_hash = tx_list[0]
+
+            position = {
+                "side": side_yn,
                 "shares": taking,
                 "paid": making,
+                "token_id": token_id,
+                "entry_price": signal["market_price"],
+                "p": signal["persistence_prob"],
+                "edge": signal["edge"],
+                "order_id": order_id,
+                "tx_hash": tx_hash,
+                "market": signal.get("market_name", ""),
+                "entry_time": datetime.now().isoformat(),
+            }
+            # Simpan posisi di window saat ini. Window ini akan resolve
+            # saat current_ts melewati (last_window_ts + 300).
+            self.open_positions.setdefault(self.last_window_ts, []).append(position)
+
+            # Log fill (bukan exit) — exit di-log nanti pas settle.
+            self.journal.log_trade_fill({
+                "window_ts": self.last_window_ts,
+                "side": side_yn,
+                "shares": taking,
+                "paid": making,
+                "order_id": order_id,
+                "tx_hash": tx_hash,
+                "bankroll_after_entry": round(self.bankroll, 4),
             })
         else:
             print(f"    [LIVE] Order failed: {result}")
+
+    def _settle_window(
+        self,
+        window_ts: int,
+        resolved_state: str,
+        start_price: float,
+        end_price: float,
+    ):
+        """
+        Settle semua posisi live yang taruhannya di window `window_ts`.
+
+        Logic:
+            - YES (taruhan UP) menang kalau resolved_state == "UP"
+            - NO  (taruhan DOWN) menang kalau resolved_state == "DOWN"
+            - Win  -> payout = shares * $1.00, credit ke bankroll
+            - Loss -> payout = $0 (paid sudah di-debit di entry, gak diapa-apain)
+
+        Update yang dilakukan per posisi:
+            - self.wins / self.losses counter
+            - self.bankroll (credit kalau menang)
+            - Journal exit (JSON event log + CSV row)
+            - Telegram notify
+
+        Catatan: arah BTC pakai harga lokal (Kraken/CoinGecko/Coinbase). Bisa
+        beda tipis dari oracle resmi Polymarket. Untuk tracking internal ini
+        cukup. Kalau mau 100% akurat, bisa di-cross-check ke gamma API
+        market.outcomePrices setelah resolve.
+        """
+        positions = self.open_positions.pop(window_ts, [])
+        if not positions:
+            return
+
+        for pos in positions:
+            side = pos["side"]
+            shares = pos["shares"]
+            paid = pos["paid"]
+
+            won = (
+                (side == "YES" and resolved_state == "UP")
+                or (side == "NO" and resolved_state == "DOWN")
+            )
+
+            if won:
+                payout = shares * 1.0  # tiap winning share = $1.00
+                pnl = payout - paid
+                self.bankroll += payout
+                self.wins += 1
+                outcome = "WIN"
+            else:
+                payout = 0.0
+                pnl = -paid
+                self.losses += 1
+                outcome = "LOSS"
+
+            now_iso = datetime.now().isoformat()
+
+            # 1. Log ke event JSON (detail lengkap, untuk replay/debugging)
+            exit_record = {
+                "outcome": outcome,
+                "pnl": round(pnl, 4),
+                "bankroll_after": round(self.bankroll, 4),
+                "side": side,
+                "shares": round(shares, 4),
+                "paid": round(paid, 4),
+                "payout": round(payout, 4),
+                "resolved_state": resolved_state,
+                "start_price": round(start_price, 2),
+                "end_price": round(end_price, 2),
+                "window_ts": window_ts,
+                "p": round(pos.get("p", 0), 4),
+                "edge": round(pos.get("edge", 0), 4),
+                "order_id": pos.get("order_id", ""),
+                "tx_hash": pos.get("tx_hash", ""),
+                "market": pos.get("market", ""),
+            }
+            self.journal.log_trade_exit(exit_record)
+
+            # 2. Log ke CSV flat (1 row per trade resolved, untuk analisis)
+            self.journal.log_csv_trade({
+                "timestamp": now_iso,
+                **exit_record,
+            })
+
+            # 3. Telegram notify (akan no-op kalau token kosong)
+            try:
+                self.telegram.notify_trade_exit(outcome, pnl, self.bankroll)
+            except Exception as e:
+                print(f"    [SETTLE] Telegram notify gagal: {e}")
+
+            # 4. Console summary
+            emoji = "🟢 WIN " if won else "🔴 LOSS"
+            print(
+                f"    <<< {emoji} {side} | shares={shares:.2f} "
+                f"paid=${paid:.2f} payout=${payout:.2f} "
+                f"P/L=${pnl:+.4f} | Bankroll: ${self.bankroll:.2f}"
+            )
 
     def _update_bot_state(self, signal: dict):
         """Update global bot_state for Flask dashboard and write to file."""
         global bot_state
         matrix = self.markov.get_transition_matrix()
 
-        # Sync on-chain pUSD balance every 30s if live mode
+        # Sync balance dari Polymarket setiap 30 detik (mode live aja).
+        # CATATAN PENTING: bankroll internal (self.bankroll) sekarang TIDAK
+        # di-overwrite dari sini. Internal counter = source of truth karena:
+        #   - Selalu real-time (debit di entry, credit di settle)
+        #   - Tidak terganggu lag on-chain settlement
+        # Balance dari API hanya buat ditampilkan di dashboard sebagai cross-check.
         onchain_bal = 0.0
-        if not self.dry_run and self.config.get("SAFE_ADDRESS"):
+        total_value = 0.0
+        bal_source = "n/a"
+
+        if not self.dry_run:
             now = time.time()
-            if now - getattr(self, '_last_balance_sync', 0) > 30:
-                onchain_bal = get_pusd_balance(self.config.get("SAFE_ADDRESS"))
+            if now - getattr(self, "_last_balance_sync", 0) > 30:
+                bal = get_account_balance(
+                    client=self.client,
+                    wallet_address=self.config.get("SAFE_ADDRESS", ""),
+                )
                 self._last_balance_sync = now
-                self._cached_onchain = onchain_bal
-                # Auto-update bankroll from on-chain (real source of truth)
-                if onchain_bal > 0:
-                    self.bankroll = onchain_bal
+                self._cached_balance = bal
             else:
-                onchain_bal = getattr(self, '_cached_onchain', 0.0)
+                bal = getattr(self, "_cached_balance", None) or {
+                    "collateral": None,
+                    "total_value": None,
+                    "source": "n/a",
+                }
+
+            onchain_bal = bal.get("collateral") or 0.0
+            total_value = bal.get("total_value") or 0.0
+            bal_source = bal.get("source") or "n/a"
 
         bot_state = {
             "bankroll": round(self.bankroll, 4),
-            "onchain_balance": round(onchain_bal, 4),
+            "onchain_balance": round(onchain_bal, 4),     # USDC liquid (CLOB)
+            "total_value": round(total_value, 4),         # USDC + posisi (Data API)
+            "balance_source": bal_source,
             "funder": self.config.get("SAFE_ADDRESS", ""),
             "state": signal["state"],
             "p": round(signal["persistence_prob"], 4),
@@ -424,6 +588,7 @@ class TradingEngine:
             "wins": self.wins,
             "losses": self.losses,
             "skips": self.skips,
+            "open_positions": sum(len(v) for v in self.open_positions.values()),
             "p_up_up": round(float(matrix["P(UP|UP)"]), 4),
             "p_dn_dn": round(float(matrix["P(DOWN|DOWN)"]), 4),
             "hist_size": len(self.markov.history),

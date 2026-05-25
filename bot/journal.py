@@ -1,12 +1,39 @@
 """
 Trade journal - logs all signals, entries, exits, and P/L.
 Used by the self-learning loop for strategy improvement.
+
+Output:
+    - data/journal/YYYY-MM-DD.json -> event log lengkap (signals/entries/fills/exits)
+    - data/journal/trades.csv      -> flat row per trade resolved (untuk analisis cepat)
 """
 
+import csv
 import json
 import os
 from datetime import datetime
 from pathlib import Path
+
+
+# Kolom CSV untuk trade resolved (1 row = 1 settle).
+CSV_COLUMNS = [
+    "timestamp",       # ISO timestamp settle
+    "window_ts",       # unix ts of 5-min window yang resolve
+    "side",            # YES / NO
+    "shares",          # jumlah shares yang dibeli
+    "paid",            # USD yang dibayar saat entry
+    "payout",          # USD payout saat resolve (shares * 1.0 kalau win, 0 kalau loss)
+    "outcome",         # WIN / LOSS
+    "pnl",             # payout - paid
+    "bankroll_after",  # bankroll setelah settle
+    "p",               # persistence prob saat entry
+    "edge",            # edge saat entry
+    "resolved_state",  # UP / DOWN (arah BTC actual)
+    "start_price",     # BTC price di awal window
+    "end_price",       # BTC price di akhir window
+    "order_id",
+    "tx_hash",
+    "market",          # nama market (untuk traceability)
+]
 
 
 class TradeJournal:
@@ -14,6 +41,7 @@ class TradeJournal:
     Persistent trade journal that logs:
     - Every signal detected (entry/skip)
     - Trade entries with Markov state
+    - Trade fills (live order execution result)
     - Trade exits with P/L
     - Session summaries
     """
@@ -22,7 +50,9 @@ class TradeJournal:
         self.journal_dir = Path(journal_dir)
         self.journal_dir.mkdir(parents=True, exist_ok=True)
         self.today_file = self.journal_dir / f"{datetime.now().strftime('%Y-%m-%d')}.json"
+        self.csv_file = self.journal_dir / "trades.csv"
         self.trades = self._load_today()
+        self._ensure_csv_header()
 
     def _load_today(self) -> list:
         """Load today's journal entries."""
@@ -35,6 +65,49 @@ class TradeJournal:
         """Save journal to disk."""
         with open(self.today_file, "w") as f:
             json.dump(self.trades, f, indent=2, default=str)
+
+    def _ensure_csv_header(self):
+        """Tulis header CSV kalau file belum ada."""
+        if not self.csv_file.exists():
+            try:
+                with open(self.csv_file, "w", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+                    writer.writeheader()
+            except Exception as e:
+                print(f"[JOURNAL] Gagal tulis CSV header: {e}")
+
+    def log_trade_fill(self, fill: dict):
+        """
+        Log konfirmasi fill dari live order (saat order matched).
+        Beda dari entry: entry = sinyal "mau beli", fill = "udah dibeli".
+
+        Args:
+            fill: Dict dengan keys spt order_id, tx_hash, side, shares,
+                  paid, token_id, window_ts.
+        """
+        entry = {
+            "type": "fill",
+            "timestamp": datetime.now().isoformat(),
+            **fill,
+        }
+        self.trades.append(entry)
+        self._save()
+
+    def log_csv_trade(self, trade: dict):
+        """
+        Append 1 row ke trades.csv (setiap trade yang udah resolve).
+
+        Args:
+            trade: Dict dengan kolom-kolom CSV_COLUMNS (key yang gak ada
+                   akan diisi string kosong).
+        """
+        try:
+            row = {col: trade.get(col, "") for col in CSV_COLUMNS}
+            with open(self.csv_file, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+                writer.writerow(row)
+        except Exception as e:
+            print(f"[JOURNAL] Gagal tulis CSV row: {e}")
 
     def log_signal(self, signal: dict):
         """
