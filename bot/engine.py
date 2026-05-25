@@ -49,9 +49,16 @@ class TradingEngine:
         self.config = config
         self.dry_run = config.get("DRY_RUN", True)
         self.min_edge = config.get("MIN_EDGE", 0.05)
-        self.min_prob = config.get("MIN_PROB", 0.87)
+        # MIN_PROB diturunkan ke 0.40 — observasi: BTC 5m sering anti-persistent,
+        # persistence 0.20-0.40 muncul dominan. Threshold 0.55+ bikin bot
+        # kelaparan (semua di-skip). User bisa override di .env.
+        self.min_prob = config.get("MIN_PROB", 0.40)
         self.bankroll = config.get("BANKROLL", 2.0)
         self.loop_interval = config.get("LOOP_INTERVAL", 81)
+        # Safeguard "stuck": kalau gak ada trade dalam X menit, log warning
+        # dan invalidate market cache (force re-discover slug Polymarket).
+        # Default 45 menit = 9 windows BTC 5m.
+        self.stale_minutes = int(config.get("STALE_MINUTES", 45))
 
         # Initialize components
         # Use smaller window for faster adaptation to current trend
@@ -97,6 +104,11 @@ class TradingEngine:
         self.open_positions: dict[int, list[dict]] = {}
         # File untuk persist open_positions supaya gak hilang saat bot restart.
         self._positions_file = Path("data/open_positions.json")
+        # Timestamp trade terakhir (entry sukses), buat safeguard "stuck".
+        # Init = startup time, supaya hitungan stuck mulai dari boot.
+        self._last_trade_time = time.time()
+        # Counter berapa kali consecutive skip — buat log periodik.
+        self._consecutive_skips = 0
 
     def start(self):
         """Start the trading loop."""
@@ -261,8 +273,37 @@ class TradingEngine:
 
         if signal["action"] == "ENTER":
             self._execute_trade(signal)
+            # Reset stuck counter setelah trade berhasil dievaluasi
+            self._consecutive_skips = 0
+            self._last_trade_time = time.time()
         else:
             self.skips += 1
+            self._consecutive_skips += 1
+            # Safeguard: kalau gak ada trade dalam X menit, kemungkinan
+            # stuck (market cache stale, threshold ketinggian, atau market
+            # baru belum muncul). Invalidate cache + log warning.
+            stuck_seconds = time.time() - self._last_trade_time
+            if stuck_seconds > self.stale_minutes * 60:
+                print(
+                    f"    [STUCK] No trade in {stuck_seconds/60:.1f} min "
+                    f"({self._consecutive_skips} consecutive skips). "
+                    f"Refreshing market cache..."
+                )
+                # Invalidate cached market di PolymarketClient supaya
+                # find_btc_market() force re-fetch dari gamma API
+                if self.client:
+                    self.client._cached_market = None
+                    self.client._cache_time = 0
+                # Reset timer biar warning gak spam tiap tick
+                self._last_trade_time = time.time()
+                # Notify Telegram (kalau aktif)
+                try:
+                    self.telegram.notify_error(
+                        f"Bot stuck {stuck_seconds/60:.0f}m no trade "
+                        f"({self._consecutive_skips} skips). Cache refreshed."
+                    )
+                except Exception:
+                    pass
 
     def _evaluate_signal(self, state: str, persistence: float) -> dict:
         """Evaluate whether to enter a trade."""
@@ -297,16 +338,26 @@ class TradingEngine:
             "market_name": market_name,
         }
 
-        # Entry conditions
+        # Entry conditions — pesan dibuat eksplisit & informatif biar gampang
+        # debug pas di-skip. Format: "<reason> (threshold: X)"
         if persistence < self.min_prob:
-            signal["reason"] = f"persistence {persistence:.3f} < {self.min_prob}"
+            signal["reason"] = (
+                f"persistence {persistence:.3f} too low "
+                f"(threshold: {self.min_prob:.2f})"
+            )
         elif edge < self.min_edge:
-            signal["reason"] = f"edge {edge:.3f} < {self.min_edge}"
+            signal["reason"] = (
+                f"edge {edge:+.3f} too low "
+                f"(threshold: {self.min_edge:.2f}, p={persistence:.3f} q={market_price:.3f})"
+            )
         elif self.bankroll < self.kelly.min_bet:
-            signal["reason"] = f"bankroll ${self.bankroll:.2f} < min bet"
+            signal["reason"] = (
+                f"bankroll ${self.bankroll:.2f} below min bet "
+                f"(threshold: ${self.kelly.min_bet:.2f})"
+            )
         else:
             signal["action"] = "ENTER"
-            signal["reason"] = "conditions met"
+            signal["reason"] = "all conditions met"
 
         # Log signal
         self.journal.log_signal(signal)
