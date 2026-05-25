@@ -13,8 +13,15 @@ env_path = Path(__file__).parent.parent / ".env.bot"
 if env_path.exists():
     load_dotenv(env_path)
 else:
-    # Try default .env
     load_dotenv()
+
+# Apply proxy from .env if set (for geoblock bypass)
+proxy = os.getenv("PROXY_URL", "").strip()
+if proxy:
+    os.environ["HTTP_PROXY"] = proxy
+    os.environ["HTTPS_PROXY"] = proxy
+    os.environ["ALL_PROXY"] = proxy
+    print(f"[PROXY] Routing through: {proxy.split('@')[-1] if '@' in proxy else proxy}")
 
 from bot.engine import TradingEngine
 
@@ -26,7 +33,7 @@ def load_config() -> dict:
         "DRY_RUN": os.getenv("DRY_RUN", "true").lower() == "true",
         "MIN_EDGE": float(os.getenv("MIN_EDGE", "0.05")),
         "MIN_PROB": float(os.getenv("MIN_PROB", "0.87")),
-        "MIN_BET": float(os.getenv("MIN_BET", "0.50")),
+        "MIN_BET": float(os.getenv("MIN_BET", "1.00")),
         "MAX_BET": float(os.getenv("MAX_BET", "2.00")),
         "BANKROLL": float(os.getenv("BANKROLL", "2.00")),
         "LOOP_INTERVAL": int(os.getenv("LOOP_INTERVAL", "81")),

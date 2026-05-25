@@ -1,63 +1,54 @@
 """
 Polymarket CLOB v2 client for BTC Up/Down market.
-Uses py_clob_client with pre-generated API credentials.
+Uses py_clob_client_v2 with V2 deposit wallet (signature_type=3, POLY_1271).
 """
 
 import os
 import json
 import time
 import requests
-from datetime import datetime
 
 try:
-    from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
-    from py_clob_client.constants import POLYGON
+    from py_clob_client_v2.client import ClobClient
+    from py_clob_client_v2.clob_types import (
+        ApiCreds, OrderArgs, MarketOrderArgs, OrderType,
+    )
+    from py_clob_client_v2.constants import POLYGON
     HAS_CLOB_CLIENT = True
 except ImportError:
     HAS_CLOB_CLIENT = False
 
 
 class PolymarketClient:
-    """
-    Client for Polymarket CLOB v2 API.
-    Uses py_clob_client with pre-generated API credentials.
-    """
+    """Polymarket CLOB v2 client (V2 deposit wallet flow)."""
 
     CLOB_HOST = "https://clob.polymarket.com"
     GAMMA_HOST = "https://gamma-api.polymarket.com"
 
     def __init__(self, private_key: str, safe_address: str = None,
                  api_key: str = "", api_secret: str = "", api_passphrase: str = ""):
-        """
-        Args:
-            private_key: Ethereum private key (0x prefixed)
-            safe_address: Polymarket Safe/proxy wallet address
-            api_key: Pre-generated CLOB API key
-            api_secret: Pre-generated CLOB API secret
-            api_passphrase: Pre-generated CLOB API passphrase
-        """
         self.private_key = private_key
-        self.safe_address = safe_address
+        self.safe_address = safe_address  # V2 deposit wallet address (funder)
         self.api_key = api_key
         self.api_secret = api_secret
         self.api_passphrase = api_passphrase
         self.client = None
         self.session = requests.Session()
+        self._cached_market = None
+        self._cache_time = 0
 
     def authenticate(self) -> bool:
-        """
-        Authenticate with Polymarket CLOB v2 using pre-generated API creds.
-
-        Returns:
-            True if authenticated successfully
-        """
+        """Authenticate with Polymarket CLOB v2 using deposit wallet flow."""
         if not HAS_CLOB_CLIENT:
-            print("[AUTH] py_clob_client not installed!")
+            print("[AUTH] py_clob_client_v2 not installed!")
+            return False
+
+        if not self.safe_address:
+            print("[AUTH] SAFE_ADDRESS (deposit wallet funder) required!")
             return False
 
         try:
-            # Use pre-generated API credentials
+            creds = None
             if self.api_key and self.api_secret and self.api_passphrase:
                 creds = ApiCreds(
                     api_key=self.api_key,
@@ -65,30 +56,31 @@ class PolymarketClient:
                     api_passphrase=self.api_passphrase,
                 )
 
-                self.client = ClobClient(
+            # If no creds, derive them
+            if not creds:
+                init_client = ClobClient(
                     host=self.CLOB_HOST,
                     chain_id=POLYGON,
                     key=self.private_key,
-                    creds=creds,
+                    signature_type=3,
+                    funder=self.safe_address,
                 )
-            else:
-                # Try without creds (will derive)
-                self.client = ClobClient(
-                    host=self.CLOB_HOST,
-                    chain_id=POLYGON,
-                    key=self.private_key,
-                )
-                # Derive API key
-                creds = self.client.derive_api_key()
-                self.client = ClobClient(
-                    host=self.CLOB_HOST,
-                    chain_id=POLYGON,
-                    key=self.private_key,
-                    creds=creds,
-                )
+                creds = init_client.create_or_derive_api_key()
+                self.api_key = creds.api_key
+                self.api_secret = creds.api_secret
+                self.api_passphrase = creds.api_passphrase
+                print(f"[AUTH] Derived API key: {creds.api_key[:10]}...")
 
-            # Test connection
-            print(f"[AUTH] Authenticated successfully!")
+            # Init authenticated client (V2 deposit wallet, sig_type=3)
+            self.client = ClobClient(
+                host=self.CLOB_HOST,
+                chain_id=POLYGON,
+                key=self.private_key,
+                creds=creds,
+                signature_type=3,
+                funder=self.safe_address,
+            )
+            print(f"[AUTH] Authenticated! Funder: {self.safe_address[:10]}...")
             return True
 
         except Exception as e:
@@ -96,251 +88,143 @@ class PolymarketClient:
             return False
 
     def find_btc_market(self) -> dict | None:
-        """
-        Find the active BTC 5-minute Up/Down market.
-        Uses dynamic slug based on current UTC timestamp (rolling 5-min windows).
-        Polymarket uses UTC timestamps in slugs directly.
-        """
-        # Use cache if fresh (< 30 seconds) AND not expired
-        if hasattr(self, '_cached_market') and self._cached_market and \
-           (time.time() - self._cache_time < 30):
+        """Find active BTC 5-min Up/Down market via dynamic slug."""
+        if self._cached_market and (time.time() - self._cache_time < 30):
             return self._cached_market
 
         market = None
-
-        # BTC 5m markets use slug: btc-updown-5m-{unix_timestamp}
-        # The timestamp in slug is ET-based (UTC-4), rounded to 5 min
-        # We need to find a market that is CURRENTLY accepting orders
-        # (not yet resolved)
         current_ts = int(time.time())
         current_window = (current_ts // 300) * 300
 
-        # Try multiple windows: future windows first (accepting orders)
-        # then current (might still be open)
         slugs_to_try = [
-            f"btc-updown-5m-{current_window + 600}",   # 2 windows ahead
-            f"btc-updown-5m-{current_window + 300}",   # next window
-            f"btc-updown-5m-{current_window + 900}",   # 3 windows ahead
-            f"btc-updown-5m-{current_window}",          # current window
+            f"btc-updown-5m-{current_window + 600}",
+            f"btc-updown-5m-{current_window + 300}",
+            f"btc-updown-5m-{current_window + 900}",
+            f"btc-updown-5m-{current_window}",
         ]
 
         for slug in slugs_to_try:
             try:
-                url = f"{self.GAMMA_HOST}/events"
-                params = {"slug": slug}
-                response = self.session.get(url, params=params, timeout=10)
-                if response.status_code == 200:
-                    events = response.json()
-                    if events and len(events) > 0:
-                        event = events[0]
-                        event_markets = event.get("markets", [])
-                        if not event_markets:
+                response = self.session.get(
+                    f"{self.GAMMA_HOST}/events",
+                    params={"slug": slug},
+                    timeout=10,
+                )
+                if response.status_code != 200:
+                    continue
+                events = response.json()
+                if not events:
+                    continue
+
+                m = events[0].get("markets", [{}])[0]
+                if m.get("closed", False):
+                    continue
+
+                end_date = m.get("endDate", "")
+                if end_date:
+                    try:
+                        from datetime import datetime, timezone
+                        end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                        if end_dt < datetime.now(timezone.utc):
                             continue
+                    except Exception:
+                        pass
 
-                        # BTC Up/Down: 1 market with 2 clobTokenIds
-                        # clobTokenIds[0] = UP token, clobTokenIds[1] = DOWN token
-                        m = event_markets[0]
+                clob_ids = m.get("clobTokenIds", [])
+                if isinstance(clob_ids, str):
+                    try:
+                        clob_ids = json.loads(clob_ids)
+                    except Exception:
+                        clob_ids = []
+                if len(clob_ids) < 2:
+                    continue
 
-                        # Skip if closed
-                        if m.get("closed", False):
-                            continue
-
-                        # Skip if expired
-                        end_date = m.get("endDate", "")
-                        if end_date:
-                            try:
-                                from datetime import datetime, timezone
-                                end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-                                if end_dt < datetime.now(timezone.utc):
-                                    continue
-                            except Exception:
-                                pass
-
-                        clob_ids_raw = m.get("clobTokenIds", [])
-                        # Handle both list and JSON string format
-                        if isinstance(clob_ids_raw, str):
-                            import json as _json
-                            try:
-                                clob_ids = _json.loads(clob_ids_raw)
-                            except Exception:
-                                clob_ids = []
+                up_price = down_price = 0.5
+                prices_raw = m.get("outcomePrices", "")
+                if prices_raw:
+                    try:
+                        if isinstance(prices_raw, str):
+                            prices = json.loads(prices_raw) if prices_raw.startswith("[") else prices_raw.split(",")
                         else:
-                            clob_ids = clob_ids_raw
+                            prices = prices_raw
+                        up_price = float(prices[0])
+                        down_price = float(prices[1])
+                    except Exception:
+                        pass
 
-                        if len(clob_ids) >= 2:
-                            question = m.get("question", "")
-                            # Parse prices from outcomePrices (can be string or list)
-                            up_price = 0.5
-                            down_price = 0.5
-                            prices_raw = m.get("outcomePrices", "")
-                            if prices_raw:
-                                try:
-                                    if isinstance(prices_raw, str):
-                                        # Could be JSON string '["0.52","0.48"]' or comma-separated "0.52,0.48"
-                                        if prices_raw.startswith("["):
-                                            import json as _json
-                                            prices = _json.loads(prices_raw)
-                                        else:
-                                            prices = prices_raw.split(",")
-                                    else:
-                                        prices = prices_raw
-                                    up_price = float(prices[0])
-                                    down_price = float(prices[1])
-                                except Exception:
-                                    pass
+                if up_price >= 0.95 or down_price >= 0.95:
+                    continue
 
-                            # Skip if price is 0.99+ (market already resolved/no liquidity)
-                            if up_price >= 0.95 or down_price >= 0.95:
-                                print(f"[MARKET] Skipping {slug} - price {up_price}/{down_price} (resolved/no liquidity)")
-                                continue
-
-                            print(f"[MARKET] Found: {question[:60]} (slug={slug})")
-                            print(f"[MARKET] UP price={up_price:.3f} | DOWN price={down_price:.3f}")
-                            market = {
-                                "id": m.get("id"),
-                                "condition_id": m.get("conditionId", ""),
-                                "question": question,
-                                "yes_token_id": clob_ids[0],  # UP token
-                                "no_token_id": clob_ids[1],   # DOWN token
-                                "yes_price": up_price,
-                                "no_price": down_price,
-                                "volume": m.get("volume", 0),
-                                "end_date": end_date,
-                            }
-                            break
-            except Exception as e:
+                market = {
+                    "id": m.get("id"),
+                    "condition_id": m.get("conditionId", ""),
+                    "question": m.get("question", ""),
+                    "yes_token_id": clob_ids[0],
+                    "no_token_id": clob_ids[1],
+                    "yes_price": up_price,
+                    "no_price": down_price,
+                    "volume": m.get("volume", 0),
+                    "end_date": end_date,
+                }
+                print(f"[MARKET] {market['question'][:50]} | UP={up_price:.3f} DOWN={down_price:.3f}")
+                break
+            except Exception:
                 continue
 
         if market:
             self._cached_market = market
             self._cache_time = time.time()
-            return market
-
-        print(f"[MARKET] No active BTC Up/Down market found (ts={current_window})")
-        return None
-
-    def _parse_market(self, market: dict) -> dict:
-        """Parse raw market data into usable format."""
-        tokens = market.get("tokens", [])
-        yes_token = None
-        no_token = None
-
-        for token in tokens:
-            outcome = str(token.get("outcome", "")).lower()
-            if outcome in ("yes", "up"):
-                yes_token = token
-            elif outcome in ("no", "down"):
-                no_token = token
-
-        # If tokens not found by outcome, try clobTokenIds
-        if not yes_token and not no_token:
-            clob_ids = market.get("clobTokenIds", [])
-            if len(clob_ids) >= 2:
-                yes_token = {"token_id": clob_ids[0], "price": 0.5}
-                no_token = {"token_id": clob_ids[1], "price": 0.5}
-            elif len(tokens) >= 2:
-                yes_token = tokens[0]
-                no_token = tokens[1]
-
-        # ALWAYS prefer clobTokenIds if available (correct for CLOB orderbook)
-        clob_ids = market.get("clobTokenIds", [])
-        if clob_ids and len(clob_ids) >= 2:
-            yes_token_id = clob_ids[0]
-            no_token_id = clob_ids[1]
         else:
-            yes_token_id = yes_token.get("token_id") if yes_token else None
-            no_token_id = no_token.get("token_id") if no_token else None
-
-        return {
-            "id": market.get("id") or market.get("condition_id") or market.get("conditionId"),
-            "condition_id": market.get("conditionId") or market.get("condition_id"),
-            "question": market.get("question"),
-            "yes_token_id": yes_token_id,
-            "no_token_id": no_token_id,
-            "yes_price": float(yes_token.get("price", 0.5)) if yes_token else 0.5,
-            "no_price": float(no_token.get("price", 0.5)) if no_token else 0.5,
-            "volume": market.get("volume", 0),
-            "end_date": market.get("endDate") or market.get("end_date_iso"),
-        }
+            print("[MARKET] No active BTC market found")
+        return market
 
     def get_market_price(self, market: dict, side: str = "YES") -> float:
-        """
-        Get current market price for YES (UP) or NO (DOWN).
-        Tries orderbook first, falls back to cached outcomePrices.
-        """
+        """Get live price from orderbook."""
         try:
             token_id = market["yes_token_id"] if side == "YES" else market["no_token_id"]
-
             if self.client and token_id:
-                # Use py_clob_client to get live orderbook
                 book = self.client.get_order_book(token_id)
                 if book:
-                    # Best ask = cheapest price to buy
                     if book.asks and len(book.asks) > 0:
                         price = float(book.asks[0].price)
-                        if 0.01 < price < 0.99:  # Valid price range
+                        if 0.01 < price < 0.99:
                             return price
-                    # If no asks, try best bid
                     if book.bids and len(book.bids) > 0:
                         price = float(book.bids[0].price)
                         if 0.01 < price < 0.99:
                             return price
         except Exception as e:
-            # Don't print error every tick - only if not 404
             if "404" not in str(e):
-                print(f"[PRICE] Error: {e}")
+                print(f"[PRICE] Error: {str(e)[:80]}")
 
-        # Fallback to cached market data from Gamma API
         fallback = market.get(f"{side.lower()}_price", 0.5)
-        if 0.01 < fallback < 0.99:
-            return fallback
-        return 0.5  # Safe default
-
-    def get_balance(self) -> float:
-        """Get collateral balance (USDC) on Polymarket."""
-        try:
-            if self.client:
-                balance = self.client.get_balance_allowance()
-                if balance:
-                    return float(balance.get("balance", 0)) / 1e6  # USDC has 6 decimals
-        except Exception as e:
-            print(f"[BALANCE] Error: {e}")
-        return 0.0
+        return fallback if 0.01 < fallback < 0.99 else 0.5
 
     def place_market_order(self, token_id: str, amount: float, side: str = "BUY") -> dict | None:
         """
-        Place a market order on CLOB v2.
-
-        Args:
-            token_id: Token ID to trade
-            amount: Dollar amount to spend
-            side: 'BUY' or 'SELL'
-
-        Returns:
-            Order result dict or None if failed
+        Place a MARKET order (FOK) on Polymarket V2.
+        amount = USD amount to spend.
         """
         if not self.client:
             print("[ORDER] Client not authenticated")
             return None
 
         try:
-            # Create market buy order using py_clob_client
-            order_args = OrderArgs(
+            order_args = MarketOrderArgs(
                 token_id=token_id,
                 amount=amount,
                 side=side,
+                order_type=OrderType.FOK,
             )
-
-            # Place as market order (FOK - Fill or Kill)
-            result = self.client.create_and_post_order(order_args)
-
+            result = self.client.create_and_post_market_order(
+                order_args, order_type=OrderType.FOK,
+            )
             if result:
-                print(f"[ORDER] Placed {side} ${amount} - Result: {result}")
+                status = result.get("status", "?") if isinstance(result, dict) else "?"
+                print(f"[ORDER] {side} ${amount:.2f} → status={status}")
                 return result
-            else:
-                print(f"[ORDER] No result returned")
-                return None
-
+            print("[ORDER] No result returned")
+            return None
         except Exception as e:
-            print(f"[ORDER] Error: {e}")
+            print(f"[ORDER] Error: {str(e)[:200]}")
             return None
